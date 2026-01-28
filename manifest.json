@@ -2,12 +2,11 @@
   "id": "com.ncsender.wireless-pendant",
   "name": "Wireless Pendant Flasher",
   "version": "0.1.0",
-  "minAppVersion": "0.3.131",
+  "minAppVersion": "0.3.151",
+  "entry": "index.js",
   "author": "ncSender",
   "description": "Flash ncSender wireless pendant firmware via USB or OTA",
-  "entry": "index.js",
-  "icon": "logo.png",
   "category": "utility",
-  "events": [],
-  "permissions": []
+  "repository": "https://github.com/siganberg/ncsender-plugin-wirelesspendant",
+  "icon": "logo.png"
 }

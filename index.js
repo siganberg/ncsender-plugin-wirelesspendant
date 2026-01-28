@@ -22,9 +22,55 @@ import { flashUSB, flashOTA } from './flasher.js';
 
 const ACTIVATION_API_URL = 'https://franciscreation.com/api/license/activate';
 const ACTIVATION_API_KEY = 'ncsp-2025-fc-api-key';
-const HEARTBEAT_TIMEOUT_MS = 10000;
+const FIRMWARE_RELEASES_REPO = 'siganberg/ncSender.pendant.releases';
 
 let serialPortModule = null;
+
+function compareVersions(v1, v2) {
+  const parts1 = v1.split('.').map(Number);
+  const parts2 = v2.split('.').map(Number);
+
+  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+    const num1 = parts1[i] || 0;
+    const num2 = parts2[i] || 0;
+
+    if (num1 > num2) return 1;
+    if (num1 < num2) return -1;
+  }
+
+  return 0;
+}
+
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+async function fetchLatestFirmwareRelease() {
+  const url = `https://api.github.com/repos/${FIRMWARE_RELEASES_REPO}/releases/latest`;
+  const response = await fetch(url, {
+    headers: { 'Accept': 'application/vnd.github.v3+json' }
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub API returned ${response.status}`);
+  }
+
+  const release = await response.json();
+  const latestVersion = (release.tag_name || '').replace(/^v/, '');
+  const releaseNotes = release.body || '';
+  const releaseUrl = release.html_url || '';
+  const publishedAt = release.published_at || '';
+
+  const binAsset = (release.assets || []).find(a => a.name.endsWith('.bin'));
+  const downloadUrl = binAsset ? binAsset.browser_download_url : null;
+
+  return { latestVersion, releaseNotes, downloadUrl, releaseUrl, publishedAt };
+}
 
 async function getSerialPorts() {
   if (!serialPortModule) {
@@ -74,70 +120,21 @@ async function activateWithServer(installationId, machineId, productName) {
 class PendantTracker {
   constructor(ctx) {
     this.ctx = ctx;
-    this.pendant = null;
-    this.timeoutTimer = null;
-  }
-
-  handleIdentify(data) {
-    const { machineId, ip, version, productName, licensed } = data || {};
-    if (!machineId) return;
-
-    this.pendant = { machineId, ip, version, productName, licensed: !!licensed, lastSeen: Date.now() };
-    this.ctx.log('Pendant identified:', machineId, 'ip:', ip, 'version:', version, 'product:', productName);
-    this.resetTimeout();
-  }
-
-  handleHeartbeat(data) {
-    if (!this.pendant) return;
-    const { machineId } = data || {};
-    if (machineId && machineId === this.pendant.machineId) {
-      this.pendant.lastSeen = Date.now();
-      this.resetTimeout();
-    }
-  }
-
-  handleDisconnect(data) {
-    const { machineId } = data || {};
-    if (this.pendant && (!machineId || machineId === this.pendant.machineId)) {
-      this.ctx.log('Pendant disconnected:', this.pendant.machineId);
-      this.clear();
-    }
-  }
-
-  resetTimeout() {
-    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
-    this.timeoutTimer = setTimeout(() => {
-      if (this.pendant) {
-        this.ctx.log('Pendant heartbeat timeout:', this.pendant.machineId);
-        this.pendant = null;
-      }
-    }, HEARTBEAT_TIMEOUT_MS);
-  }
-
-  clear() {
-    this.pendant = null;
-    if (this.timeoutTimer) {
-      clearTimeout(this.timeoutTimer);
-      this.timeoutTimer = null;
-    }
-  }
-
-  isConnected() {
-    return this.pendant !== null;
   }
 
   getInfo() {
-    return this.pendant;
+    const clients = this.ctx.getConnectedClients({ product: 'ncSenderPendant' });
+    return clients.length > 0 ? clients[0] : null;
   }
 
-  destroy() {
-    this.clear();
+  isConnected() {
+    return this.getInfo() !== null;
   }
 }
 
 // --- Tabbed Dialog ---
 
-function buildDialogHtml(ports, pendant, savedSettings) {
+function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
   const portsJson = JSON.stringify(ports);
   const hasPendant = pendant !== null;
   const isLicensed = hasPendant && pendant.licensed;
@@ -204,7 +201,7 @@ function buildDialogHtml(ports, pendant, savedSettings) {
         padding: 20px;
         display: flex;
         flex-direction: column;
-        height: 320px;
+        height: 400px;
         width: 460px;
       }
       .wp-tab-content {
@@ -258,6 +255,7 @@ function buildDialogHtml(ports, pendant, savedSettings) {
         color: var(--color-text-primary);
         user-select: all;
         word-break: break-all;
+        text-align: center;
       }
       .installation-id-input {
         font-family: monospace;
@@ -540,6 +538,44 @@ function buildDialogHtml(ports, pendant, savedSettings) {
         border: 1px solid #dc3545;
         color: #dc3545;
       }
+
+      .fw-update-banner {
+        padding: 12px;
+        border-radius: var(--radius-small);
+        font-size: 0.85rem;
+        margin-bottom: 14px;
+      }
+      .fw-update-banner.error {
+        background: #dc354520;
+        border: 1px solid #dc3545;
+        color: #dc3545;
+        text-align: center;
+      }
+      .fw-update-banner.up-to-date {
+        background: #28a74520;
+        border: 1px solid #28a745;
+        color: #28a745;
+        text-align: center;
+      }
+      .fw-update-banner.update-available {
+        background: #1e3a5f40;
+        border: 1px solid #3a7cbd;
+        color: var(--color-text-primary);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .fw-view-details {
+        color: #7eb8e0;
+        cursor: pointer;
+        font-weight: 600;
+        white-space: nowrap;
+        text-decoration: none;
+      }
+      .fw-view-details:hover {
+        text-decoration: underline;
+      }
     </style>
 
     <!-- Tabs -->
@@ -561,6 +597,12 @@ function buildDialogHtml(ports, pendant, savedSettings) {
             <label>Pendant Machine ID</label>
             <div class="readonly-field">${pendant.machineId}</div>
           </div>
+          ${savedInstallationId ? `
+          <div class="form-group">
+            <label>Installation ID</label>
+            <div class="readonly-field">${escapeHtml(savedInstallationId)}</div>
+          </div>
+          ` : ''}
           <div class="status-msg show success">License active</div>
         ` : `
           <div class="form-group">
@@ -585,6 +627,16 @@ function buildDialogHtml(ports, pendant, savedSettings) {
 
       <!-- Firmware Tab -->
       <div class="wp-tab-content active" id="wp-tab-firmware" style="justify-content:center">
+        ${firmwareUpdate ? (firmwareUpdate.error ? `
+          <div class="fw-update-banner error">${escapeHtml(firmwareUpdate.error)}</div>
+        ` : firmwareUpdate.hasUpdate ? `
+          <div class="fw-update-banner update-available">
+            <span>Firmware update available: v${escapeHtml(firmwareUpdate.latestVersion)}</span>
+            <a class="fw-view-details" id="fwViewDetailsBtn">View Details</a>
+          </div>
+        ` : `
+          <div class="fw-update-banner up-to-date">v${escapeHtml(firmwareUpdate.currentVersion)} &mdash; Firmware is up to date</div>
+        `) : ''}
         <div class="ws-flash-form" id="wsFirmwareForm">
           <div class="form-group">
             <label>Firmware File (.bin)</label>
@@ -1029,6 +1081,173 @@ function buildDialogHtml(ports, pendant, savedSettings) {
             }
           }
         }
+
+        // --- View Details button ---
+        var fwViewDetailsBtn = document.getElementById('fwViewDetailsBtn');
+        if (fwViewDetailsBtn) {
+          fwViewDetailsBtn.addEventListener('click', function() {
+            window.postMessage({
+              type: 'close-plugin-dialog',
+              data: { action: 'show-update-details' }
+            }, '*');
+          });
+        }
+      })();
+    </script>
+  `;
+}
+
+// --- Update Details Dialog ---
+
+function buildUpdateDetailsHtml(firmwareUpdate, pendant) {
+  const hasPendant = pendant !== null;
+  const pendantIp = hasPendant ? pendant.ip : null;
+
+  let publishedLine = '';
+  if (firmwareUpdate.publishedAt) {
+    try {
+      const d = new Date(firmwareUpdate.publishedAt);
+      publishedLine = `<div class="fud-published">Published: ${d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}</div>`;
+    } catch {}
+  }
+
+  return /* html */ `
+    <style>
+      .fud-container {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 20px;
+        max-width: 560px;
+      }
+      .fud-versions {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        padding: 12px;
+        background: var(--color-surface-muted);
+        border-radius: var(--radius-small);
+      }
+      .fud-version-block {
+        text-align: center;
+      }
+      .fud-version-label {
+        font-size: 0.75rem;
+        color: var(--color-text-secondary);
+        margin-bottom: 4px;
+      }
+      .fud-version-value {
+        font-family: monospace;
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: var(--color-text-primary);
+      }
+      .fud-arrow {
+        font-size: 1.2rem;
+        color: var(--color-text-secondary);
+      }
+      .fud-published {
+        font-size: 0.8rem;
+        color: var(--color-text-secondary);
+        text-align: center;
+      }
+      .fud-notes-label {
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: var(--color-text-primary);
+      }
+      .fud-notes {
+        max-height: 200px;
+        overflow-y: auto;
+        padding: 10px;
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-small);
+        font-size: 0.8rem;
+        color: var(--color-text-secondary);
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.5;
+      }
+      .fud-footer {
+        display: flex;
+        gap: 10px;
+        justify-content: center;
+        padding-top: 4px;
+      }
+      .fud-btn {
+        padding: 10px 20px;
+        border: none;
+        border-radius: var(--radius-small);
+        font-size: 0.9rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: opacity 0.2s;
+      }
+      .fud-btn:hover { opacity: 0.9; }
+      .fud-btn-primary {
+        background: var(--color-accent);
+        color: white;
+      }
+      .fud-btn-secondary {
+        background: var(--color-surface-muted);
+        color: var(--color-text-primary);
+        border: 1px solid var(--color-border);
+      }
+    </style>
+
+    <div class="fud-container">
+      <div class="fud-versions">
+        <div class="fud-version-block">
+          <div class="fud-version-label">Current</div>
+          <div class="fud-version-value">v${escapeHtml(firmwareUpdate.currentVersion)}</div>
+        </div>
+        <div class="fud-arrow">&rarr;</div>
+        <div class="fud-version-block">
+          <div class="fud-version-label">Latest</div>
+          <div class="fud-version-value">v${escapeHtml(firmwareUpdate.latestVersion)}</div>
+        </div>
+      </div>
+
+      ${publishedLine}
+
+      ${firmwareUpdate.releaseNotes ? `
+        <div>
+          <div class="fud-notes-label">Release Notes</div>
+          <div class="fud-notes">${escapeHtml(firmwareUpdate.releaseNotes)}</div>
+        </div>
+      ` : ''}
+
+      <div class="fud-footer">
+        <button type="button" class="fud-btn fud-btn-secondary" id="fudCloseBtn">Close</button>
+        ${firmwareUpdate.downloadUrl && hasPendant ? `<button type="button" class="fud-btn fud-btn-primary" id="fudDownloadBtn">Download &amp; Flash OTA</button>` : ''}
+      </div>
+    </div>
+
+    <script>
+      (function() {
+        var closeBtn = document.getElementById('fudCloseBtn');
+        if (closeBtn) {
+          closeBtn.addEventListener('click', function() {
+            window.postMessage({ type: 'close-plugin-dialog' }, '*');
+          });
+        }
+
+        var downloadBtn = document.getElementById('fudDownloadBtn');
+        if (downloadBtn) {
+          downloadBtn.addEventListener('click', function() {
+            window.postMessage({
+              type: 'close-plugin-dialog',
+              data: {
+                action: 'download-and-flash',
+                downloadUrl: ${firmwareUpdate.downloadUrl ? JSON.stringify(firmwareUpdate.downloadUrl) : 'null'},
+                pendantIp: ${pendantIp ? JSON.stringify(pendantIp) : 'null'},
+                latestVersion: ${JSON.stringify(firmwareUpdate.latestVersion)}
+              }
+            }, '*');
+          });
+        }
       })();
     </script>
   `;
@@ -1218,18 +1437,43 @@ export async function onLoad(ctx) {
 
   const tracker = new PendantTracker(ctx);
 
-  ctx.registerEventHandler('identify', (data) => tracker.handleIdentify(data));
-  ctx.registerEventHandler('heartbeat', (data) => tracker.handleHeartbeat(data));
-  ctx.registerEventHandler('disconnect', (data) => tracker.handleDisconnect(data));
+  ctx.registerEventHandler('client:connected', (data) => {
+    if (data.product === 'ncSenderPendant') {
+      ctx.log('Pendant connected:', data.machineId, 'ip:', data.ip);
+    }
+  });
 
-  ctx.emitToClient('discover', {});
+  ctx.registerEventHandler('client:disconnected', (data) => {
+    if (data.product === 'ncSenderPendant') {
+      ctx.log('Pendant disconnected:', data.machineId);
+    }
+  });
 
   ctx.registerToolMenu('Wireless Pendant', async () => {
     const ports = await getSerialPorts();
     const savedSettings = ctx.getSettings() || {};
     const pendant = tracker.getInfo();
 
-    const dialogHtml = buildDialogHtml(ports, pendant, savedSettings);
+    let firmwareUpdate = null;
+    if (pendant && pendant.version) {
+      try {
+        const release = await fetchLatestFirmwareRelease();
+        firmwareUpdate = {
+          currentVersion: pendant.version,
+          latestVersion: release.latestVersion,
+          hasUpdate: compareVersions(release.latestVersion, pendant.version) > 0,
+          releaseNotes: release.releaseNotes,
+          downloadUrl: release.downloadUrl,
+          releaseUrl: release.releaseUrl,
+          publishedAt: release.publishedAt
+        };
+      } catch (err) {
+        ctx.log('Failed to check firmware updates:', err?.message || err);
+        firmwareUpdate = { error: 'Could not check for firmware updates' };
+      }
+    }
+
+    const dialogHtml = buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate);
     const response = await ctx.showDialog('Wireless Pendant', dialogHtml, { closable: true, width: '500px' });
 
     if (!response || !response.action) return;
@@ -1241,6 +1485,79 @@ export async function onLoad(ctx) {
         lastMethod: 'usb',
         lastBaudRate: response.baudRate || savedSettings.lastBaudRate
       });
+      return;
+    }
+
+    // --- Handle: Show Update Details ---
+    if (response.action === 'show-update-details' && firmwareUpdate && firmwareUpdate.hasUpdate) {
+      const detailsHtml = buildUpdateDetailsHtml(firmwareUpdate, pendant);
+      const detailsResponse = await ctx.showDialog('Firmware Update', detailsHtml, { closable: true, width: '560px' });
+
+      if (detailsResponse && detailsResponse.action === 'download-and-flash') {
+        // Fall through to download-and-flash handler below
+        Object.assign(response, detailsResponse);
+      } else {
+        return;
+      }
+    }
+
+    // --- Handle: Download & Flash OTA ---
+    if (response.action === 'download-and-flash') {
+      const { downloadUrl, pendantIp, latestVersion } = response;
+
+      ctx.log('Download & Flash OTA:', downloadUrl, 'target:', pendantIp);
+      ctx.showModal(buildProgressModalHtml(), { closable: false });
+
+      const tmpDir = os.tmpdir();
+      const binPath = path.join(tmpDir, `pendant-firmware-${latestVersion}-${Date.now()}.bin`);
+
+      const broadcastProgress = (percent, message, log) => {
+        ctx.broadcast('pendant-flash:progress', { percent, message, log });
+      };
+
+      try {
+        broadcastProgress(undefined, 'Downloading firmware...', `Downloading from GitHub...\nVersion: ${latestVersion}`);
+
+        const dlResponse = await fetch(downloadUrl);
+        if (!dlResponse.ok) {
+          throw new Error(`Download failed (HTTP ${dlResponse.status})`);
+        }
+
+        const arrayBuffer = await dlResponse.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        await fs.writeFile(binPath, buffer);
+        ctx.log('Firmware downloaded to temp file:', binPath, `(${buffer.length} bytes)`);
+
+        broadcastProgress(0, 'Starting OTA flash...', `Target: ${pendantIp}\nFirmware size: ${buffer.length} bytes`);
+
+        const flasher = flashOTA({ binPath, pendantIp });
+
+        await new Promise((resolve, reject) => {
+          flasher.on('progress', (percent, msg) => broadcastProgress(percent, msg));
+          flasher.on('message', (msg) => broadcastProgress(undefined, msg, msg));
+          flasher.on('error', (msg) => {
+            ctx.broadcast('pendant-flash:error', { message: msg, log: msg });
+            reject(new Error(msg));
+          });
+          flasher.on('complete', (msg) => {
+            ctx.broadcast('pendant-flash:complete', { message: msg || 'Firmware updated successfully via OTA.' });
+            resolve();
+          });
+        });
+      } catch (err) {
+        ctx.log('Download & Flash failed:', err?.message || err);
+        ctx.broadcast('pendant-flash:error', {
+          message: err?.message || 'Download & Flash failed',
+          log: err?.message || 'Unknown error'
+        });
+      } finally {
+        try {
+          await fs.unlink(binPath);
+          ctx.log('Cleaned up temp file:', binPath);
+        } catch {
+          // ignore cleanup errors
+        }
+      }
       return;
     }
 
