@@ -1092,6 +1092,34 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
             }, '*');
           });
         }
+
+        // --- Auto-refresh on pendant connect/disconnect ---
+        (function() {
+          var wsUrl;
+          if (window.location.port === '5174') {
+            wsUrl = 'ws://' + window.location.hostname + ':8090';
+          } else if (window.location.protocol === 'file:') {
+            wsUrl = 'ws://localhost:8090';
+          } else {
+            var u = new URL(window.location.origin);
+            u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+            wsUrl = u.toString();
+          }
+          var rws = new WebSocket(wsUrl);
+          rws.onmessage = function(event) {
+            if (window._wsFlashing) return;
+            try {
+              var msg = JSON.parse(event.data);
+              if (msg && (msg.type === 'client:connected' || msg.type === 'client:disconnected')) {
+                var d = msg.data || {};
+                if (d.product === 'ncSenderPendant') {
+                  window.postMessage({ type: 'close-plugin-dialog', data: { action: 'refresh' } }, '*');
+                  rws.close();
+                }
+              }
+            } catch (e) {}
+          };
+        })();
       })();
     </script>
   `;
@@ -1450,33 +1478,54 @@ export async function onLoad(ctx) {
   });
 
   ctx.registerToolMenu('Wireless Pendant', async () => {
-    const ports = await getSerialPorts();
-    const savedSettings = ctx.getSettings() || {};
-    const pendant = tracker.getInfo();
-
+    let response;
     let firmwareUpdate = null;
-    if (pendant && pendant.version) {
+    let cachedRelease = null;
+
+    // Fetch firmware release once
+    const pendant0 = tracker.getInfo();
+    if (pendant0 && pendant0.version) {
       try {
-        const release = await fetchLatestFirmwareRelease();
-        firmwareUpdate = {
-          currentVersion: pendant.version,
-          latestVersion: release.latestVersion,
-          hasUpdate: compareVersions(release.latestVersion, pendant.version) > 0,
-          releaseNotes: release.releaseNotes,
-          downloadUrl: release.downloadUrl,
-          releaseUrl: release.releaseUrl,
-          publishedAt: release.publishedAt
-        };
+        cachedRelease = await fetchLatestFirmwareRelease();
       } catch (err) {
         ctx.log('Failed to check firmware updates:', err?.message || err);
-        firmwareUpdate = { error: 'Could not check for firmware updates' };
+        cachedRelease = { error: 'Could not check for firmware updates' };
       }
     }
 
-    const dialogHtml = buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate);
-    const response = await ctx.showDialog('Wireless Pendant', dialogHtml, { closable: true, width: '500px' });
+    // Loop to support auto-refresh when pendant state changes
+    while (true) {
+      const ports = await getSerialPorts();
+      const savedSettings = ctx.getSettings() || {};
+      const pendant = tracker.getInfo();
+
+      firmwareUpdate = null;
+      if (pendant && pendant.version && cachedRelease) {
+        if (cachedRelease.error) {
+          firmwareUpdate = { error: cachedRelease.error };
+        } else {
+          firmwareUpdate = {
+            currentVersion: pendant.version,
+            latestVersion: cachedRelease.latestVersion,
+            hasUpdate: compareVersions(cachedRelease.latestVersion, pendant.version) > 0,
+            releaseNotes: cachedRelease.releaseNotes,
+            downloadUrl: cachedRelease.downloadUrl,
+            releaseUrl: cachedRelease.releaseUrl,
+            publishedAt: cachedRelease.publishedAt
+          };
+        }
+      }
+
+      const dialogHtml = buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate);
+      response = await ctx.showDialog('Wireless Pendant', dialogHtml, { closable: true, width: '500px' });
+
+      if (response && response.action === 'refresh') continue;
+      break;
+    }
 
     if (!response || !response.action) return;
+    const savedSettings = ctx.getSettings() || {};
+    const pendant = tracker.getInfo();
 
     // --- Handle: Web Serial done (browser-side flash completed) ---
     if (response.action === 'web-serial-done') {
