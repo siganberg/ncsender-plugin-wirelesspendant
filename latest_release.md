@@ -1,4 +1,4 @@
 ## What's Changed
 
-### 🔧 Improvements
-- Added project documentation and licensing information
+### ✨ New Features
+- Added a reactive dialog that automatically refreshes when the pendant state changes, providing real-time status updates during flashing
