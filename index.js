@@ -26,21 +26,6 @@ const FIRMWARE_RELEASES_REPO = 'siganberg/ncSender.pendant.releases';
 
 let serialPortModule = null;
 
-function compareVersions(v1, v2) {
-  const parts1 = v1.split('.').map(Number);
-  const parts2 = v2.split('.').map(Number);
-
-  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
-    const num1 = parts1[i] || 0;
-    const num2 = parts2[i] || 0;
-
-    if (num1 > num2) return 1;
-    if (num1 < num2) return -1;
-  }
-
-  return 0;
-}
-
 function escapeHtml(str) {
   return str
     .replace(/&/g, '&amp;')
@@ -115,120 +100,71 @@ async function activateWithServer(installationId, machineId, productName) {
   return JSON.parse(text);
 }
 
-// --- Pendant autodetection ---
+async function activatePendant(pendantIp, licenseData) {
+  const url = `http://${pendantIp}/api/activate`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(licenseData),
+    signal: AbortSignal.timeout(10000)
+  });
 
-class PendantTracker {
-  constructor(ctx) {
-    this.ctx = ctx;
+  const text = await response.text();
+
+  if (!response.ok) {
+    let message = `Pendant activation failed (HTTP ${response.status})`;
+    try {
+      const err = JSON.parse(text);
+      if (err.error || err.message) message = err.error || err.message;
+    } catch {}
+    throw new Error(message);
   }
 
-  getInfo() {
-    const clients = this.ctx.getConnectedClients({ product: 'ncSenderPendant' });
-    return clients.length > 0 ? clients[0] : null;
-  }
-
-  isConnected() {
-    return this.getInfo() !== null;
-  }
+  return text ? JSON.parse(text) : { success: true };
 }
 
-// --- Tabbed Dialog ---
+// --- Main Dialog ---
 
-function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
+function buildDialogHtml(ports, savedSettings) {
   const portsJson = JSON.stringify(ports);
-  const hasPendant = pendant !== null;
-  const isLicensed = hasPendant && pendant.licensed;
+  const savedIp = savedSettings.lastPendantIp || '';
   const savedInstallationId = savedSettings.lastInstallationId || '';
-  const savedMethod = savedSettings.lastMethod || 'usb';
 
   return /* html */ `
     <style>
-      .wp-tabs {
-        display: flex;
-        border-bottom: 1px solid var(--color-border);
-        background: var(--color-surface-muted);
-        padding: var(--gap-xs, 4px) var(--gap-md, 16px) 0 var(--gap-md, 16px);
-        gap: 2px;
-      }
-      .wp-tab {
-        all: unset;
-        display: flex;
-        align-items: center;
-        gap: var(--gap-xs, 4px);
-        padding: var(--gap-sm, 8px) var(--gap-md, 16px);
-        background: transparent !important;
-        border: none !important;
-        border-radius: var(--radius-small) var(--radius-small) 0 0 !important;
-        color: var(--color-text-secondary) !important;
-        cursor: pointer;
-        transition: all 0.2s ease;
-        font-size: 0.95rem;
-        font-weight: 500;
-        margin-top: var(--gap-xs, 4px);
-        position: relative;
-        box-sizing: border-box;
-      }
-      .wp-tab:hover {
-        background: var(--color-surface) !important;
-        color: var(--color-text-primary);
-        transform: translateY(-1px);
-        filter: none !important;
-      }
-      .wp-tab.active {
-        background: var(--color-surface) !important;
-        color: var(--color-text-primary) !important;
-        box-shadow: var(--shadow-elevated);
-        border-bottom: 2px solid var(--color-accent) !important;
-        filter: none !important;
-      }
-      .wp-tab.active::after {
-        content: '';
-        position: absolute;
-        bottom: -1px;
-        left: 0;
-        right: 0;
-        height: 2px;
-        background: var(--gradient-accent, var(--color-accent));
-        border-radius: 2px 2px 0 0;
-      }
-      .wp-tab:focus-visible {
-        outline: 2px solid var(--color-accent);
-        outline-offset: 2px;
-      }
-      .wp-tab-label { font-weight: 600; }
-      .wp-content {
-        overflow-y: auto;
+      .wp-container {
         padding: 20px;
         display: flex;
         flex-direction: column;
-        height: 400px;
-        width: 460px;
+        gap: 16px;
+        width: 480px;
+        position: relative;
       }
-      .wp-tab-content {
-        display: none;
-        flex: 1;
-        flex-direction: column;
-        gap: 18px;
-      }
-      .wp-tab-content.active {
-        display: flex;
-      }
-
       .form-group {
         display: flex;
         flex-direction: column;
-        gap: 4px;
+        gap: 8px;
       }
       .form-group label {
         font-size: 0.85rem;
         font-weight: 500;
         color: var(--color-text-primary);
-        text-align: center;
       }
       .form-group .hint {
         font-size: 0.75rem;
         color: var(--color-text-secondary);
         text-align: center;
+      }
+      .form-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .form-row input {
+        flex: 1;
+      }
+      .form-row .btn {
+        flex-shrink: 0;
       }
       input[type="text"], select {
         padding: 0 10px;
@@ -237,7 +173,7 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
         box-sizing: border-box;
         border: 1px solid var(--color-border);
         border-radius: var(--radius-small);
-        font-size: 0.85rem;
+        font-size: 0.9rem;
         background: var(--color-surface);
         color: var(--color-text-primary);
       }
@@ -245,66 +181,180 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
         outline: none;
         border-color: var(--color-accent);
       }
-      .readonly-field {
-        padding: 8px 10px;
-        border: 1px solid var(--color-border);
+      .btn {
+        padding: 0 16px;
+        height: 36px;
+        border: none;
         border-radius: var(--radius-small);
         font-size: 0.85rem;
-        font-family: monospace;
+        font-weight: 500;
+        cursor: pointer;
+        transition: opacity 0.2s;
+        white-space: nowrap;
+        text-align: center;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        box-sizing: border-box;
+      }
+      .btn:hover { opacity: 0.9; }
+      .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .btn-primary { background: var(--color-accent); color: white; }
+      .btn-secondary {
         background: var(--color-surface-muted);
         color: var(--color-text-primary);
-        user-select: all;
-        word-break: break-all;
-        text-align: center;
+        border: 1px solid var(--color-border);
       }
-      .installation-id-input {
-        font-family: monospace;
-        font-size: 1rem;
-        letter-spacing: 1px;
-        text-align: center;
-        text-transform: uppercase;
-      }
+      .btn-success { background: #28a745; color: white; }
+      .btn-full { width: 100%; }
+
       .status-msg {
         padding: 10px;
         border-radius: var(--radius-small);
         font-size: 0.85rem;
         text-align: center;
-        display: none;
+        margin-bottom: 12px;
       }
-      .status-msg.show { display: block; }
-      .status-msg.error {
-        background: #dc354520;
-        border: 1px solid #dc3545;
-        color: #dc3545;
+      .status-msg.error { background: #dc354520; border: 1px solid #dc3545; color: #dc3545; }
+      .status-msg.success { background: #28a74520; border: 1px solid #28a745; color: #28a745; }
+      .status-msg.info { background: #17a2b820; border: 1px solid #17a2b8; color: #17a2b8; }
+
+      .device-info {
+        background: var(--color-surface-muted);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-small);
+        padding: 12px;
       }
-      .status-msg.success {
-        background: #28a74520;
-        border: 1px solid #28a745;
-        color: #28a745;
-      }
-      .no-pendant {
-        padding: 16px;
-        text-align: center;
-      }
-      .no-pendant h3 {
-        margin: 0 0 8px 0;
-        color: var(--color-text-primary);
-      }
-      .no-pendant p {
-        margin: 0;
+      .device-info-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 4px 0;
         font-size: 0.85rem;
-        color: var(--color-text-secondary);
+      }
+      .device-info-label { color: var(--color-text-secondary); }
+      .device-info-value { color: var(--color-text-primary); font-weight: 500; font-family: monospace; }
+      .device-info-value.licensed { color: #28a745; }
+      .device-info-value.not-licensed { color: #dc3545; }
+
+      .action-buttons {
+        display: flex;
+        gap: 10px;
+        justify-content: center;
+        margin-top: 8px;
       }
 
+      .section-divider {
+        border-top: 1px solid var(--color-border);
+        margin: 8px 0;
+      }
+
+      .activation-form {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .installation-id-input {
+        font-family: monospace;
+        font-size: 0.95rem;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+      }
+
+      .accordion-trigger {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        padding: 12px 14px;
+        background: var(--color-surface-muted);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-small);
+        cursor: pointer;
+        transition: all 0.2s ease;
+        box-sizing: border-box;
+      }
+      .accordion-trigger:hover {
+        background: var(--color-surface);
+        border-color: var(--color-text-secondary);
+      }
+      .accordion-trigger.expanded {
+        border-color: var(--color-accent);
+        border-bottom-left-radius: 0;
+        border-bottom-right-radius: 0;
+        border-bottom-color: transparent;
+      }
+      .accordion-trigger-content {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .accordion-trigger-icon {
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        flex-shrink: 0;
+      }
+      .accordion-trigger-icon.activate {
+        background: #28a74530;
+        color: #28a745;
+      }
+      .accordion-trigger-icon.flash {
+        background: var(--color-accent-muted, rgba(100, 180, 200, 0.2));
+        color: var(--color-accent);
+      }
+      .accordion-trigger-label {
+        font-size: 0.9rem;
+        font-weight: 500;
+        color: var(--color-text-primary);
+      }
+      .accordion-trigger-chevron {
+        width: 16px;
+        height: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--color-text-secondary);
+        transition: transform 0.2s ease;
+      }
+      .accordion-trigger.expanded .accordion-trigger-chevron {
+        transform: rotate(180deg);
+      }
+      .accordion-content {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 14px;
+        background: var(--color-surface);
+        border: 1px solid var(--color-accent);
+        border-top: none;
+        border-bottom-left-radius: var(--radius-small);
+        border-bottom-right-radius: var(--radius-small);
+        overflow: hidden;
+        max-height: 0;
+        opacity: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        transition: all 0.25s ease;
+      }
+      .accordion-content.expanded {
+        max-height: 400px;
+        opacity: 1;
+        padding-top: 14px;
+        padding-bottom: 14px;
+      }
       .file-picker {
         display: flex;
         gap: 8px;
-        align-items: stretch;
+        align-items: center;
       }
       .file-picker input[type="file"] { display: none; }
       .file-picker .file-name {
         flex: 1;
-        padding: 0 10px;
+        padding: 0 12px;
         height: 36px;
         box-sizing: border-box;
         border: 1px solid var(--color-border);
@@ -312,32 +362,15 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
         font-size: 0.85rem;
         background: var(--color-surface);
         color: var(--color-text-secondary);
-        white-space: nowrap;
+        display: flex;
+        align-items: center;
         overflow: hidden;
         text-overflow: ellipsis;
-        display: flex;
-        align-items: center;
-      }
-      .file-picker .file-name.has-file {
-        color: var(--color-text-primary);
-      }
-      .file-picker .browse-btn {
-        padding: 0 14px;
-        height: 36px;
-        box-sizing: border-box;
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-small);
-        font-size: 0.85rem;
-        font-weight: 500;
-        cursor: pointer;
-        background: var(--color-surface-muted);
-        color: var(--color-text-primary);
         white-space: nowrap;
-        display: flex;
-        align-items: center;
-        justify-content: center;
       }
-      .file-picker .browse-btn:hover { opacity: 0.9; }
+      .file-picker .file-name.has-file { color: var(--color-text-primary); }
+      .file-picker .btn { flex-shrink: 0; }
+
       .method-toggle {
         display: flex;
         border: 1px solid var(--color-border);
@@ -347,18 +380,18 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
       }
       .method-toggle label {
         flex: 1;
-        padding: 0 16px;
-        height: 36px;
         display: flex;
         align-items: center;
         justify-content: center;
+        text-align: center;
         cursor: pointer;
         font-size: 0.85rem;
         font-weight: 500;
         background: var(--color-surface);
         color: var(--color-text-secondary);
         transition: background 0.2s, color 0.2s;
-        border: none;
+        padding: 0;
+        margin: 0;
         box-sizing: border-box;
       }
       .method-toggle input[type="radio"] { display: none; }
@@ -366,497 +399,337 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
         background: var(--color-accent);
         color: white;
       }
-      .method-section {
-        display: none;
-        flex-direction: column;
-        gap: 10px;
+
+      .usb-options { margin-top: 8px; }
+
+      .hidden { display: none !important; }
+
+      /* In-dialog modal overlay */
+      .dialog-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.7);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 0.2s ease, visibility 0.2s ease;
       }
-      .method-section.active { display: flex; }
-      .port-row {
-        display: grid;
-        grid-template-columns: 1fr 120px;
-        gap: 8px;
+      .dialog-overlay.visible {
+        opacity: 1;
+        visibility: visible;
       }
-      .ota-warning {
-        padding: 10px;
-        border-radius: var(--radius-small);
-        background: #1e3a5f40;
-        border: 1px solid #3a7cbd;
-        color: #7eb8e0;
-        font-size: 0.85rem;
+      .dialog-modal {
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-medium, 8px);
+        padding: 20px 24px;
+        min-width: 280px;
+        max-width: 360px;
         text-align: center;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.4);
       }
+      .dialog-modal-title {
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--color-text-primary);
+        margin-bottom: 16px;
+      }
+      .dialog-modal-spinner {
+        width: 32px;
+        height: 32px;
+        border: 3px solid var(--color-border);
+        border-top-color: var(--color-accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin: 0 auto 12px;
+      }
+      .dialog-modal-text {
+        font-size: 0.85rem;
+        color: var(--color-text-secondary);
+        margin-bottom: 0;
+      }
+      .dialog-modal-icon {
+        margin-bottom: 12px;
+      }
+      .dialog-modal-icon svg {
+        width: 40px;
+        height: 40px;
+      }
+      .dialog-modal-message {
+        font-size: 0.9rem;
+        color: var(--color-text-secondary);
+        line-height: 1.5;
+        margin: 0;
+      }
+      .dialog-modal-btn {
+        margin-top: 16px;
+        padding: 8px 24px;
+        border: none;
+        border-radius: var(--radius-small);
+        font-size: 0.85rem;
+        font-weight: 500;
+        cursor: pointer;
+        background: var(--color-accent);
+        color: white;
+      }
+      .dialog-modal-progress {
+        width: 100%;
+        height: 6px;
+        background: var(--color-surface-muted);
+        border-radius: 3px;
+        overflow: hidden;
+        margin: 12px 0;
+      }
+      .dialog-modal-progress-bar {
+        height: 100%;
+        width: 0%;
+        background: var(--color-accent);
+        border-radius: 3px;
+        transition: width 0.3s ease;
+      }
+
+      .spinner {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(255,255,255,0.3);
+        border-top-color: white;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin-right: 6px;
+        flex-shrink: 0;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
 
       .plugin-dialog-footer {
         padding: 12px 16px;
         border-top: 1px solid var(--color-border);
         background: var(--color-surface);
-      }
-      .button-group {
         display: flex;
-        gap: 10px;
         justify-content: center;
-      }
-      .btn {
-        padding: 10px 20px;
-        border: none;
-        border-radius: var(--radius-small);
-        font-size: 0.9rem;
-        font-weight: 500;
-        cursor: pointer;
-        transition: opacity 0.2s;
-      }
-      .btn:hover { opacity: 0.9; }
-      .btn-secondary {
-        background: var(--color-surface-muted);
-        color: var(--color-text-primary);
-        border: 1px solid var(--color-border);
-      }
-      .btn-primary {
-        background: var(--color-accent);
-        color: white;
-      }
-      .btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      /* Web Serial UI */
-      .ws-port-btn {
-        padding: 0 14px;
-        height: 36px;
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-small);
-        font-size: 0.85rem;
-        font-weight: 500;
-        cursor: pointer;
-        background: var(--color-accent);
-        color: white;
-        width: 100%;
-        box-sizing: border-box;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-      .ws-port-btn:hover { opacity: 0.9; }
-      .ws-port-btn.has-port {
-        background: var(--color-surface);
-        color: var(--color-text-primary);
-        border-color: var(--color-accent);
-      }
-      .ws-warning {
-        padding: 12px;
-        border-radius: var(--radius-small);
-        background: var(--color-surface-muted);
-        border: 1px solid var(--color-border);
-        color: var(--color-text-secondary);
-        font-size: 0.8rem;
-        text-align: left;
-        line-height: 1.5;
-      }
-      .ws-warning-url {
-        display: block;
-        margin-top: 8px;
-        font-family: monospace;
-        font-size: 0.8rem;
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-small);
-        padding: 8px 10px;
-        user-select: all;
-        cursor: pointer;
-        word-break: break-all;
-        color: var(--color-text-primary);
-        text-align: center;
-        transition: border-color 0.2s;
-      }
-      .ws-warning-url:hover {
-        border-color: var(--color-accent);
-      }
-      .ws-warning-url.copied {
-        border-color: #28a745;
-      }
-      .ws-flash-form {
-        display: flex;
-        flex-direction: column;
-        gap: 18px;
-      }
-      .ws-flash-form.hidden { display: none; }
-      .ws-flash-progress {
-        display: none;
-        flex-direction: column;
-        gap: 10px;
-      }
-      .ws-flash-progress.active { display: flex; }
-      .ws-progress-bar-container {
-        width: 100%;
-        height: 8px;
-        background: var(--color-surface-muted);
-        border-radius: 4px;
-        overflow: hidden;
-      }
-      .ws-progress-bar {
-        height: 100%;
-        width: 0%;
-        background: var(--color-accent);
-        border-radius: 4px;
-        transition: width 0.3s ease;
-      }
-      .ws-progress-text {
-        font-size: 0.85rem;
-        color: var(--color-text-secondary);
-      }
-      .ws-flash-log {
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-small);
-        padding: 10px;
-        font-family: monospace;
-        font-size: 0.8rem;
-        color: var(--color-text-secondary);
-        max-height: 200px;
-        overflow-y: auto;
-        white-space: pre-wrap;
-        word-break: break-all;
-      }
-      .ws-flash-result {
-        padding: 10px;
-        border-radius: var(--radius-small);
-        font-size: 0.85rem;
-        text-align: center;
-        display: none;
-      }
-      .ws-flash-result.success {
-        display: block;
-        background: #28a74520;
-        border: 1px solid #28a745;
-        color: #28a745;
-      }
-      .ws-flash-result.error {
-        display: block;
-        background: #dc354520;
-        border: 1px solid #dc3545;
-        color: #dc3545;
-      }
-
-      .fw-update-banner {
-        padding: 12px;
-        border-radius: var(--radius-small);
-        font-size: 0.85rem;
-        margin-bottom: 14px;
-      }
-      .fw-update-banner.error {
-        background: #dc354520;
-        border: 1px solid #dc3545;
-        color: #dc3545;
-        text-align: center;
-      }
-      .fw-update-banner.up-to-date {
-        background: #28a74520;
-        border: 1px solid #28a745;
-        color: #28a745;
-        text-align: center;
-      }
-      .fw-update-banner.update-available {
-        background: #1e3a5f40;
-        border: 1px solid #3a7cbd;
-        color: var(--color-text-primary);
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-      }
-      .fw-view-details {
-        color: #7eb8e0;
-        cursor: pointer;
-        font-weight: 600;
-        white-space: nowrap;
-        text-decoration: none;
-      }
-      .fw-view-details:hover {
-        text-decoration: underline;
       }
     </style>
 
-    <!-- Tabs -->
-    <div class="wp-tabs">
-      <button class="wp-tab active" data-tab="firmware">
-        <span class="wp-tab-label">Firmware</span>
-      </button>
-      <button class="wp-tab" data-tab="license">
-        <span class="wp-tab-label">License</span>
-      </button>
-    </div>
-
-    <!-- Tab Content -->
-    <div class="wp-content">
-      <!-- License Tab -->
-      <div class="wp-tab-content" id="wp-tab-license" style="justify-content:center">
-        ${hasPendant ? (isLicensed ? `
-          <div class="form-group">
-            <label>Pendant Machine ID</label>
-            <div class="readonly-field">${pendant.machineId}</div>
+    <div class="wp-container">
+      <!-- Connect Section -->
+      <div id="connectSection">
+        <div id="connectStatus" class="status-msg hidden"></div>
+        <div class="form-group">
+          <label>Pendant IP Address</label>
+          <div class="form-row">
+            <input type="text" id="pendantIp" placeholder="192.168.1.100" value="${escapeHtml(savedIp)}" />
+            <button type="button" class="btn btn-primary" id="connectBtn">Connect</button>
           </div>
-          ${savedInstallationId ? `
-          <div class="form-group">
-            <label>Installation ID</label>
-            <div class="readonly-field">${escapeHtml(savedInstallationId)}</div>
-          </div>
-          ` : ''}
-          <div class="status-msg show success">License active</div>
-        ` : `
-          <div class="form-group">
-            <label>Pendant Machine ID</label>
-            <div class="readonly-field">${pendant.machineId}</div>
-          </div>
-          <div class="form-group">
-            <label>Installation ID</label>
-            <input type="text" id="installationId" class="installation-id-input"
-                   placeholder="XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX"
-                   value="${savedInstallationId}" spellcheck="false" autocomplete="off" maxlength="41" />
-            <span class="hint">Enter the Installation ID from your purchase email</span>
-          </div>
-          <div class="status-msg" id="licenseStatus"></div>
-        `) : `
-          <div class="no-pendant">
-            <h3>No Pendant Detected</h3>
-            <p>Make sure your pendant is powered on and connected to the same network as ncSender.</p>
-          </div>
-        `}
+          <span class="hint">Enter the IP address shown on your pendant display</span>
+        </div>
       </div>
 
-      <!-- Firmware Tab -->
-      <div class="wp-tab-content active" id="wp-tab-firmware" style="justify-content:center">
-        ${firmwareUpdate ? (firmwareUpdate.error ? `
-          <div class="fw-update-banner error">${escapeHtml(firmwareUpdate.error)}</div>
-        ` : firmwareUpdate.hasUpdate ? `
-          <div class="fw-update-banner update-available">
-            <span>Firmware update available: v${escapeHtml(firmwareUpdate.latestVersion)}</span>
-            <a class="fw-view-details" id="fwViewDetailsBtn">View Details</a>
+      <!-- Device Info Section (shown after connect) -->
+      <div id="deviceSection" class="hidden">
+        <div class="device-info">
+          <div class="device-info-row">
+            <span class="device-info-label">Device ID</span>
+            <span class="device-info-value" id="deviceIdDisplay">-</span>
           </div>
-        ` : `
-          <div class="fw-update-banner up-to-date">v${escapeHtml(firmwareUpdate.currentVersion)} &mdash; Firmware is up to date</div>
-        `) : ''}
-        <div class="ws-flash-form" id="wsFirmwareForm">
-          <div class="form-group">
-            <label>Firmware File (.bin)</label>
-            <div class="file-picker">
-              <span class="file-name" id="fileName">No file selected</span>
-              <button type="button" class="browse-btn" onclick="document.getElementById('firmwareFile').click()">Browse</button>
-              <input type="file" id="firmwareFile" accept=".bin" />
+          <div class="device-info-row">
+            <span class="device-info-label">Model</span>
+            <span class="device-info-value" id="deviceModelDisplay">-</span>
+          </div>
+          <div class="device-info-row">
+            <span class="device-info-label">Firmware</span>
+            <span class="device-info-value" id="firmwareDisplay">-</span>
+          </div>
+          <div class="device-info-row">
+            <span class="device-info-label">License</span>
+            <span class="device-info-value" id="licenseDisplay">-</span>
+          </div>
+        </div>
+
+        <!-- Activation Section (shown if not licensed) -->
+        <div id="activationSection" class="hidden">
+          <div class="section-divider"></div>
+          <div class="accordion-trigger" id="showActivateBtn">
+            <div class="accordion-trigger-content">
+              <span class="accordion-trigger-icon activate">&#9919;</span>
+              <span class="accordion-trigger-label">Activate License</span>
             </div>
+            <span class="accordion-trigger-chevron">&#9662;</span>
+          </div>
+          <div id="activateForm" class="accordion-content">
+            <div class="form-group">
+              <label>Installation ID</label>
+              <input type="text" id="installationId" class="installation-id-input"
+                     placeholder="XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX"
+                     value="${escapeHtml(savedInstallationId)}" spellcheck="false" autocomplete="off" maxlength="41" />
+              <span class="hint">Enter the Installation ID from your purchase email</span>
+            </div>
+            <button type="button" class="btn btn-success btn-full" id="activateBtn" disabled>Activate</button>
+          </div>
+          <div id="activateStatus" class="status-msg hidden"></div>
+        </div>
+
+        <!-- Flash Section -->
+        <div id="flashSection">
+          <div class="section-divider"></div>
+          <div class="accordion-trigger" id="showFlashBtn">
+            <div class="accordion-trigger-content">
+              <span class="accordion-trigger-icon flash">&#8623;</span>
+              <span class="accordion-trigger-label">Flash Firmware</span>
+            </div>
+            <span class="accordion-trigger-chevron">&#9662;</span>
           </div>
 
-          <div class="form-group">
-            <label>Flash Method</label>
-            <div class="method-toggle">
-              <input type="radio" name="method" id="methodUsb" value="usb" ${savedMethod === 'usb' ? 'checked' : ''} />
-              <label for="methodUsb">USB</label>
-              <input type="radio" name="method" id="methodOta" value="ota" ${savedMethod === 'ota' ? 'checked' : ''} />
-              <label for="methodOta">OTA (Wi-Fi)</label>
+          <div id="flashForm" class="accordion-content">
+            <div class="form-group">
+              <label>Firmware File</label>
+              <div class="file-picker">
+                <span class="file-name" id="fileName">No file selected</span>
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('firmwareFile').click()">Browse</button>
+                <input type="file" id="firmwareFile" accept=".bin" />
+              </div>
             </div>
-          </div>
 
-          <div class="method-section ${savedMethod === 'usb' ? 'active' : ''}" id="usbSection">
-            <div id="usbServerMode">
+            <div class="form-group">
+              <label>Flash Method</label>
+              <div class="method-toggle">
+                <input type="radio" name="method" id="methodOta" value="ota" checked />
+                <label for="methodOta">OTA (Wi-Fi)</label>
+                <input type="radio" name="method" id="methodUsb" value="usb" />
+                <label for="methodUsb">USB</label>
+              </div>
+            </div>
+
+            <div id="usbOptions" class="usb-options hidden">
               <div class="form-group">
                 <label>Serial Port</label>
                 <select id="serialPort"></select>
               </div>
             </div>
-            <div id="usbWebSerialMode" style="display:none">
-              <div class="form-group">
-                <label>Serial Port</label>
-                <button type="button" class="ws-port-btn" id="wsSelectPortBtn">Select Port...</button>
-              </div>
-            </div>
-            <div id="wsSecureWarning" class="ws-warning" style="display:none">
-              Browser USB flashing requires a secure context. To enable it, open this Chrome flag and add this site's URL:
-              <code class="ws-warning-url" id="wsCopyUrl" title="Click to copy">chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
-              <span id="wsCopyHint" style="display:block;font-size:0.7rem;text-align:center;margin-top:4px;opacity:0.6;">Click to copy &middot; Paste in address bar &middot; Add this site &middot; Relaunch Chrome</span>
-            </div>
-            <div class="hint" style="text-align:center;font-size:0.78rem;font-style:italic;line-height:1.5;">Hold the BOOT button and power on the device. Start flashing while holding BOOT. Once progress reaches ~10%, release the BOOT button.</div>
-          </div>
 
-          <div class="method-section ${savedMethod === 'ota' ? 'active' : ''}" id="otaSection">
-            ${hasPendant
-              ? `<div class="status-msg show success">Pendant detected at ${pendant.ip}</div>`
-              : '<div class="ota-warning">No pendant detected. Connect your pendant to use OTA flashing.</div>'
-            }
-            <div class="hint" style="text-align:center;font-size:0.78rem;font-style:italic;line-height:1.5;">OTA requires the pendant to already be running ncSender Pendant Firmware. For first-time setup, use USB.</div>
+            <button type="button" class="btn btn-primary btn-full" id="flashBtn" disabled>Flash</button>
           </div>
-        </div>
-
-        <div class="ws-flash-progress" id="wsFlashProgress">
-          <div class="ws-progress-bar-container">
-            <div class="ws-progress-bar" id="wsProgressBar"></div>
-          </div>
-          <div class="ws-progress-text" id="wsProgressText">Initializing...</div>
-          <div class="ws-flash-log" id="wsFlashLog"></div>
-          <div class="ws-flash-result" id="wsFlashResult"></div>
+          <div id="flashStatus" class="status-msg hidden"></div>
         </div>
       </div>
     </div>
 
-    <!-- Footer (changes per tab) -->
+    <!-- In-dialog modal overlay -->
+    <div class="dialog-overlay" id="dialogOverlay">
+      <div class="dialog-modal">
+        <div class="dialog-modal-icon hidden" id="overlayIcon"></div>
+        <div id="overlaySpinner" class="dialog-modal-spinner"></div>
+        <div class="dialog-modal-title" id="overlayTitle">Processing...</div>
+        <div class="dialog-modal-progress hidden" id="overlayProgress">
+          <div class="dialog-modal-progress-bar" id="overlayProgressBar"></div>
+        </div>
+        <p class="dialog-modal-message" id="overlayText">Please wait</p>
+        <button type="button" class="dialog-modal-btn hidden" id="overlayCloseBtn">OK</button>
+      </div>
+    </div>
+
     <div class="plugin-dialog-footer">
-      <div class="button-group" id="firmwareFooter">
-        <button type="button" class="btn btn-secondary" id="fwCancelBtn" onclick="window.postMessage({type:'close-plugin-dialog'},'*')">Cancel</button>
-        <button type="button" class="btn btn-primary" id="flashBtn" disabled>Flash Firmware</button>
-        <button type="button" class="btn btn-secondary" id="wsRetryBtn" style="display:none">Retry</button>
-        <button type="button" class="btn btn-primary" id="wsCloseBtn" style="display:none">Close</button>
-      </div>
-      <div class="button-group" id="licenseFooter" style="display:none;">
-        <button type="button" class="btn btn-secondary" onclick="window.postMessage({type:'close-plugin-dialog'},'*')">Cancel</button>
-        ${!isLicensed ? '<button type="button" class="btn btn-primary" id="activateBtn" disabled>Activate License</button>' : ''}
-      </div>
+      <button type="button" class="btn btn-secondary" onclick="window.postMessage({type:'close-plugin-dialog'},'*')">Close</button>
     </div>
 
     <script>
       (function() {
-        // --- Tab switching ---
-        var tabs = document.querySelectorAll('.wp-tab');
-        var tabContents = document.querySelectorAll('.wp-tab-content');
-        var licenseFooter = document.getElementById('licenseFooter');
-        var firmwareFooter = document.getElementById('firmwareFooter');
-
-        tabs.forEach(function(tab) {
-          tab.addEventListener('click', function() {
-            if (window._wsFlashing) return;
-            var target = tab.getAttribute('data-tab');
-            tabs.forEach(function(t) { t.classList.remove('active'); });
-            tabContents.forEach(function(c) { c.classList.remove('active'); });
-            tab.classList.add('active');
-            document.getElementById('wp-tab-' + target).classList.add('active');
-
-            licenseFooter.style.display = target === 'license' ? 'flex' : 'none';
-            firmwareFooter.style.display = target === 'firmware' ? 'flex' : 'none';
-          });
-        });
-
-        // --- License tab ---
-        var hasPendant = ${hasPendant ? 'true' : 'false'};
-        var machineId = ${hasPendant ? JSON.stringify(pendant.machineId) : 'null'};
-        var productName = ${hasPendant ? JSON.stringify(pendant.productName || '') : 'null'};
-        var activateBtn = document.getElementById('activateBtn');
-        var installationIdInput = document.getElementById('installationId');
-
-        function formatInstallationId(raw) {
-          var clean = raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 36);
-          var parts = clean.match(/.{1,6}/g);
-          return parts ? parts.join('-') : '';
-        }
-
-        function isInstallationIdValid() {
-          if (!installationIdInput) return false;
-          var raw = installationIdInput.value.replace(/[^A-Za-z0-9]/g, '');
-          return raw.length === 36;
-        }
-
-        function updateActivateBtn() {
-          if (activateBtn) {
-            activateBtn.disabled = !hasPendant || !isInstallationIdValid();
-          }
-        }
-
-        if (installationIdInput) {
-          installationIdInput.addEventListener('input', function() {
-            var pos = this.selectionStart;
-            var oldLen = this.value.length;
-            this.value = formatInstallationId(this.value);
-            var newLen = this.value.length;
-            var newPos = pos + (newLen - oldLen);
-            this.setSelectionRange(newPos, newPos);
-            updateActivateBtn();
-          });
-        }
-
-        if (activateBtn) {
-          activateBtn.addEventListener('click', function() {
-            var instId = installationIdInput.value.trim().toUpperCase();
-            window.postMessage({
-              type: 'close-plugin-dialog',
-              data: { action: 'activate', machineId: machineId, installationId: instId, productName: productName }
-            }, '*');
-          });
-        }
-
-        updateActivateBtn();
-
-        // --- Firmware tab ---
         var ports = ${portsJson};
-        var pendantIp = ${hasPendant ? JSON.stringify(pendant.ip) : 'null'};
+        var deviceInfo = null;
         var fileBase64 = null;
         var selectedFileName = null;
 
-        var portSelect = document.getElementById('serialPort');
+        // Elements
+        var pendantIpInput = document.getElementById('pendantIp');
+        var connectBtn = document.getElementById('connectBtn');
+        var connectStatus = document.getElementById('connectStatus');
+        var connectSection = document.getElementById('connectSection');
+        var deviceSection = document.getElementById('deviceSection');
+        var activationSection = document.getElementById('activationSection');
+        var showActivateBtn = document.getElementById('showActivateBtn');
+        var activateForm = document.getElementById('activateForm');
+        var flashSection = document.getElementById('flashSection');
+        var showFlashBtn = document.getElementById('showFlashBtn');
+        var flashForm = document.getElementById('flashForm');
+        var installationIdInput = document.getElementById('installationId');
+        var activateBtn = document.getElementById('activateBtn');
+        var activateStatus = document.getElementById('activateStatus');
+        var flashBtn = document.getElementById('flashBtn');
+        var flashStatus = document.getElementById('flashStatus');
         var fileInput = document.getElementById('firmwareFile');
         var fileNameEl = document.getElementById('fileName');
-        var flashBtn = document.getElementById('flashBtn');
-        var usbSection = document.getElementById('usbSection');
-        var otaSection = document.getElementById('otaSection');
+        var portSelect = document.getElementById('serialPort');
+        var usbOptions = document.getElementById('usbOptions');
         var methodRadios = document.querySelectorAll('input[name="method"]');
 
-        // --- Web Serial detection ---
-        var hasWebSerial = 'serial' in navigator;
-        var isChromium = !!window.chrome;
-        var useWebSerial = hasWebSerial && window.isSecureContext;
-        var wsPort = null;
-        var firmwareBytes = null;
-        var usbServerMode = document.getElementById('usbServerMode');
-        var usbWebSerialMode = document.getElementById('usbWebSerialMode');
-        var wsSecureWarning = document.getElementById('wsSecureWarning');
-        var wsSelectPortBtn = document.getElementById('wsSelectPortBtn');
-        var wsFirmwareForm = document.getElementById('wsFirmwareForm');
-        var wsFlashProgress = document.getElementById('wsFlashProgress');
-        var wsProgressBar = document.getElementById('wsProgressBar');
-        var wsProgressText = document.getElementById('wsProgressText');
-        var wsFlashLog = document.getElementById('wsFlashLog');
-        var wsFlashResult = document.getElementById('wsFlashResult');
-        var wsCloseBtn = document.getElementById('wsCloseBtn');
-        var wsRetryBtn = document.getElementById('wsRetryBtn');
-        var fwCancelBtn = document.getElementById('fwCancelBtn');
+        // Overlay elements
+        var dialogOverlay = document.getElementById('dialogOverlay');
+        var overlayIcon = document.getElementById('overlayIcon');
+        var overlayTitle = document.getElementById('overlayTitle');
+        var overlaySpinner = document.getElementById('overlaySpinner');
+        var overlayProgress = document.getElementById('overlayProgress');
+        var overlayProgressBar = document.getElementById('overlayProgressBar');
+        var overlayText = document.getElementById('overlayText');
+        var overlayCloseBtn = document.getElementById('overlayCloseBtn');
 
-        if (useWebSerial) {
-          usbServerMode.style.display = 'none';
-          usbWebSerialMode.style.display = 'block';
-        } else if (isChromium && !window.isSecureContext) {
-          wsSecureWarning.style.display = 'block';
-          var wsCopyUrl = document.getElementById('wsCopyUrl');
-          var wsCopyHint = document.getElementById('wsCopyHint');
-          if (wsCopyUrl) {
-            wsCopyUrl.addEventListener('click', function() {
-              var ta = document.createElement('textarea');
-              ta.value = wsCopyUrl.textContent.trim();
-              ta.style.cssText = 'position:fixed;left:-9999px;';
-              document.body.appendChild(ta);
-              ta.select();
-              var ok = false;
-              try { ok = document.execCommand('copy'); } catch(e) {}
-              document.body.removeChild(ta);
-              if (ok) {
-                wsCopyUrl.classList.add('copied');
-                wsCopyHint.textContent = 'Copied! Paste in Chrome address bar.';
-                setTimeout(function() { wsCopyUrl.classList.remove('copied'); }, 2000);
-              } else {
-                var range = document.createRange();
-                range.selectNodeContents(wsCopyUrl);
-                var sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-                wsCopyHint.textContent = 'Selected! Press Ctrl+C to copy.';
-              }
-            });
-          }
+        var successIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="#28a745" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg>';
+        var errorIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="#dc3545" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+
+        // Overlay functions
+        function showOverlay(title, text) {
+          overlayIcon.classList.add('hidden');
+          overlaySpinner.classList.remove('hidden');
+          overlayTitle.textContent = title;
+          overlayText.textContent = text;
+          overlayText.classList.remove('hidden');
+          overlayProgress.classList.add('hidden');
+          overlayCloseBtn.classList.add('hidden');
+          dialogOverlay.classList.add('visible');
         }
 
+        function showOverlayProgress(title, text, percent) {
+          overlayIcon.classList.add('hidden');
+          overlaySpinner.classList.add('hidden');
+          overlayTitle.textContent = title;
+          overlayText.textContent = text;
+          overlayText.classList.remove('hidden');
+          overlayProgress.classList.remove('hidden');
+          overlayProgressBar.style.width = percent + '%';
+          overlayCloseBtn.classList.add('hidden');
+          dialogOverlay.classList.add('visible');
+        }
+
+        function showOverlayResult(title, message, isSuccess, callback) {
+          overlayIcon.innerHTML = isSuccess ? successIcon : errorIcon;
+          overlayIcon.classList.remove('hidden');
+          overlaySpinner.classList.add('hidden');
+          overlayProgress.classList.add('hidden');
+          overlayTitle.textContent = title;
+          overlayText.textContent = message;
+          overlayText.classList.remove('hidden');
+          overlayCloseBtn.classList.remove('hidden');
+          overlayCloseBtn.onclick = function() {
+            hideOverlay();
+            if (callback) callback();
+          };
+        }
+
+        function hideOverlay() {
+          dialogOverlay.classList.remove('visible');
+        }
+
+        // Populate port dropdown
         ports.forEach(function(p) {
           var opt = document.createElement('option');
           opt.value = p.path;
           opt.textContent = p.path + (p.manufacturer ? ' (' + p.manufacturer + ')' : '');
           portSelect.appendChild(opt);
         });
-
         if (ports.length === 0) {
           var opt = document.createElement('option');
           opt.value = '';
@@ -864,19 +737,43 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
           portSelect.appendChild(opt);
         }
 
-        function getMethod() {
-          return document.querySelector('input[name="method"]:checked').value;
+        // Accordion toggle functions
+        function collapseAll() {
+          showActivateBtn.classList.remove('expanded');
+          activateForm.classList.remove('expanded');
+          showFlashBtn.classList.remove('expanded');
+          flashForm.classList.remove('expanded');
         }
 
+        function toggleSection(trigger, content) {
+          var isExpanded = content.classList.contains('expanded');
+          collapseAll();
+          if (!isExpanded) {
+            trigger.classList.add('expanded');
+            content.classList.add('expanded');
+          }
+        }
+
+        // Activate section toggle
+        showActivateBtn.addEventListener('click', function() {
+          toggleSection(showActivateBtn, activateForm);
+        });
+
+        // Flash section toggle
+        showFlashBtn.addEventListener('click', function() {
+          toggleSection(showFlashBtn, flashForm);
+        });
+
+        // Method toggle
         methodRadios.forEach(function(radio) {
           radio.addEventListener('change', function() {
-            var method = getMethod();
-            usbSection.classList.toggle('active', method === 'usb');
-            otaSection.classList.toggle('active', method === 'ota');
+            var method = document.querySelector('input[name="method"]:checked').value;
+            usbOptions.classList.toggle('hidden', method !== 'usb');
             updateFlashBtn();
           });
         });
 
+        // File picker
         fileInput.addEventListener('change', function() {
           var file = fileInput.files[0];
           if (!file) return;
@@ -892,389 +789,223 @@ function buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate) {
               binary += String.fromCharCode(bytes[i]);
             }
             fileBase64 = btoa(binary);
-            firmwareBytes = binary;
             updateFlashBtn();
           };
           reader.readAsArrayBuffer(file);
         });
 
+        function showStatus(el, msg, type) {
+          el.textContent = msg;
+          el.className = 'status-msg ' + type;
+          el.classList.remove('hidden');
+        }
+
+        function hideStatus(el) {
+          el.classList.add('hidden');
+        }
+
+        // --- Connect ---
+        connectBtn.addEventListener('click', async function() {
+          var ip = pendantIpInput.value.trim();
+          if (!ip) {
+            showStatus(connectStatus, 'Please enter an IP address', 'error');
+            return;
+          }
+
+          connectBtn.disabled = true;
+          connectBtn.innerHTML = '<span class="spinner"></span>Connecting...';
+          hideStatus(connectStatus);
+
+          try {
+            var response = await fetch('http://' + ip + '/api/info', {
+              signal: AbortSignal.timeout(5000)
+            });
+
+            if (!response.ok) {
+              throw new Error('HTTP ' + response.status);
+            }
+
+            deviceInfo = await response.json();
+            deviceInfo._ip = ip;
+
+            // Update UI
+            document.getElementById('deviceIdDisplay').textContent = deviceInfo.deviceIdFormatted || deviceInfo.deviceId || '-';
+            document.getElementById('deviceModelDisplay').textContent = deviceInfo.deviceModel || '-';
+            document.getElementById('firmwareDisplay').textContent = 'v' + (deviceInfo.firmwareVersion || '-');
+
+            var licenseEl = document.getElementById('licenseDisplay');
+            if (deviceInfo.licensed) {
+              licenseEl.textContent = 'Active';
+              licenseEl.className = 'device-info-value licensed';
+              activationSection.classList.add('hidden');
+            } else {
+              licenseEl.textContent = 'Not Activated';
+              licenseEl.className = 'device-info-value not-licensed';
+              activationSection.classList.remove('hidden');
+            }
+
+            deviceSection.classList.remove('hidden');
+            showStatus(connectStatus, 'Connected to pendant at ' + ip, 'success');
+            updateFlashBtn();
+
+          } catch (err) {
+            showStatus(connectStatus, 'Failed to connect: ' + (err.message || 'Connection refused'), 'error');
+            deviceSection.classList.add('hidden');
+          } finally {
+            connectBtn.disabled = false;
+            connectBtn.textContent = 'Connect';
+          }
+        });
+
+        // --- Installation ID formatting ---
+        function formatInstallationId(raw) {
+          var clean = raw.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 36);
+          var parts = clean.match(/.{1,6}/g);
+          return parts ? parts.join('-') : '';
+        }
+
+        function isInstallationIdValid() {
+          var raw = installationIdInput.value.replace(/[^A-Za-z0-9]/g, '');
+          return raw.length === 36;
+        }
+
+        installationIdInput.addEventListener('input', function() {
+          var pos = this.selectionStart;
+          var oldLen = this.value.length;
+          this.value = formatInstallationId(this.value);
+          var newLen = this.value.length;
+          var newPos = pos + (newLen - oldLen);
+          this.setSelectionRange(newPos, newPos);
+          activateBtn.disabled = !isInstallationIdValid();
+        });
+
+        activateBtn.disabled = !isInstallationIdValid();
+
+        // --- Activate ---
+        activateBtn.addEventListener('click', function() {
+          if (!deviceInfo) return;
+
+          var instId = installationIdInput.value.trim().toUpperCase();
+          window.postMessage({
+            type: 'close-plugin-dialog',
+            data: {
+              action: 'activate',
+              pendantIp: deviceInfo._ip,
+              deviceId: deviceInfo.deviceId,
+              installationId: instId
+            }
+          }, '*');
+        });
+
+        // --- Flash ---
         function updateFlashBtn() {
           var hasFile = fileBase64 !== null;
-          var method = getMethod();
-          var valid = hasFile;
+          var method = document.querySelector('input[name="method"]:checked').value;
+          var valid = hasFile && deviceInfo;
           if (method === 'usb') {
-            if (useWebSerial) {
-              valid = valid && wsPort !== null;
-            } else {
-              valid = valid && portSelect.value !== '';
-            }
-          } else {
-            valid = valid && hasPendant;
+            valid = hasFile && portSelect.value !== '';
           }
           flashBtn.disabled = !valid;
         }
 
         portSelect.addEventListener('change', updateFlashBtn);
-        updateFlashBtn();
 
-        flashBtn.addEventListener('click', function() {
-          var method = getMethod();
-          if (method === 'usb' && useWebSerial && wsPort) {
-            doWebSerialFlash().catch(function(err) {
-              console.error('Web Serial flash error:', err);
-            });
-            return;
-          }
-          var response = {
-            action: 'flash',
-            firmwareBase64: fileBase64,
-            firmwareFileName: selectedFileName || 'firmware.bin',
-            method: method
-          };
+        flashBtn.addEventListener('click', async function() {
+          if (!fileBase64) return;
+
+          var method = document.querySelector('input[name="method"]:checked').value;
+
+          // USB flashing needs server-side esptool
           if (method === 'usb') {
-            response.port = portSelect.value;
-            response.baudRate = '115200';
-          } else {
-            response.pendantIp = pendantIp;
-          }
-          window.postMessage({ type: 'close-plugin-dialog', data: response }, '*');
-        });
-
-        // --- Web Serial port selection ---
-        if (wsSelectPortBtn) {
-          wsSelectPortBtn.addEventListener('click', async function() {
-            try {
-              wsPort = await navigator.serial.requestPort({
-                filters: [
-                  { usbVendorId: 0x10C4 },
-                  { usbVendorId: 0x1A86 },
-                  { usbVendorId: 0x0403 },
-                  { usbVendorId: 0x303A }
-                ]
-              });
-              var info = wsPort.getInfo();
-              var label = 'Port selected';
-              if (info.usbVendorId) {
-                label = 'USB device (0x' + info.usbVendorId.toString(16).toUpperCase() + ')';
-              }
-              wsSelectPortBtn.textContent = label;
-              wsSelectPortBtn.classList.add('has-port');
-              updateFlashBtn();
-            } catch (e) {
-              // User cancelled the port picker
-            }
-          });
-        }
-
-        // --- Web Serial close button ---
-        if (wsCloseBtn) {
-          wsCloseBtn.addEventListener('click', function() {
-            window.postMessage({ type: 'close-plugin-dialog', data: {
-              action: 'web-serial-done',
-              baudRate: '115200'
-            }}, '*');
-          });
-        }
-
-        // --- Web Serial retry button ---
-        if (wsRetryBtn) {
-          wsRetryBtn.addEventListener('click', function() {
-            wsFirmwareForm.classList.remove('hidden');
-            wsFlashProgress.classList.remove('active');
-            wsProgressBar.style.width = '0%';
-            wsProgressText.textContent = 'Initializing...';
-            wsFlashLog.textContent = '';
-            wsFlashResult.className = 'ws-flash-result';
-            wsFlashResult.textContent = '';
-            fwCancelBtn.style.display = '';
-            flashBtn.style.display = '';
-            wsCloseBtn.style.display = 'none';
-            wsRetryBtn.style.display = 'none';
-            updateFlashBtn();
-          });
-        }
-
-        // --- Web Serial flash ---
-        async function doWebSerialFlash() {
-          window._wsFlashing = true;
-          var baudrate = 115200;
-
-          // Hide form, show inline progress
-          wsFirmwareForm.classList.add('hidden');
-          wsFlashProgress.classList.add('active');
-          fwCancelBtn.style.display = 'none';
-          flashBtn.style.display = 'none';
-
-          function wsAppendLog(text) {
-            wsFlashLog.textContent += text + '\\n';
-            wsFlashLog.scrollTop = wsFlashLog.scrollHeight;
-          }
-
-          function wsShowResult(type, msg) {
-            wsFlashResult.className = 'ws-flash-result ' + type;
-            wsFlashResult.textContent = msg;
-            wsCloseBtn.style.display = '';
-            if (type === 'error') wsRetryBtn.style.display = '';
-            window._wsFlashing = false;
-          }
-
-          var transport = null;
-
-          try {
-            wsAppendLog('Loading esptool-js...');
-            wsProgressText.textContent = 'Loading esptool-js...';
-
-            var esptoolModule = await import('https://esm.run/esptool-js');
-            var ESPLoader = esptoolModule.ESPLoader;
-            var Transport = esptoolModule.Transport;
-
-            wsAppendLog('Creating transport...');
-            wsProgressText.textContent = 'Connecting to device...';
-
-            transport = new Transport(wsPort, true);
-
-            var espTerminal = {
-              clean: function() {},
-              writeLine: function(data) { wsAppendLog(data); },
-              write: function(data) { wsAppendLog(data); }
-            };
-
-            var loader = new ESPLoader({
-              transport: transport,
-              baudrate: baudrate,
-              terminal: espTerminal
-            });
-
-            wsAppendLog('Connecting to ESP32...');
-            await loader.main();
-            wsAppendLog('Connected. Chip: ' + (loader.chipName || 'unknown'));
-
-            wsProgressText.textContent = 'Flashing firmware...';
-            wsAppendLog('Starting flash at address 0x10000...');
-
-            await loader.writeFlash({
-              fileArray: [{ data: firmwareBytes, address: 0x10000 }],
-              flashSize: 'keep',
-              compress: true,
-              reportProgress: function(fileIndex, written, total) {
-                var pct = Math.round((written / total) * 100);
-                wsProgressBar.style.width = pct + '%';
-                wsProgressText.textContent = 'Flashing... ' + pct + '%';
-              }
-            });
-
-            wsProgressBar.style.width = '100%';
-            wsProgressText.textContent = 'Flash complete!';
-            wsAppendLog('Flash complete. Resetting device...');
-
-            try { await loader.hardReset(); } catch(e) { wsAppendLog('Note: Hard reset skipped'); }
-
-            wsShowResult('success', 'Firmware flashed successfully.');
-          } catch (err) {
-            var errMsg = (err && err.message) ? err.message : String(err);
-            wsAppendLog('ERROR: ' + errMsg);
-            wsProgressText.textContent = 'Flash failed';
-            wsShowResult('error', 'Flash failed: ' + errMsg);
-          } finally {
-            if (transport) {
-              try { await transport.disconnect(); } catch(e) {}
-            }
-          }
-        }
-
-        // --- View Details button ---
-        var fwViewDetailsBtn = document.getElementById('fwViewDetailsBtn');
-        if (fwViewDetailsBtn) {
-          fwViewDetailsBtn.addEventListener('click', function() {
-            window.postMessage({
-              type: 'close-plugin-dialog',
-              data: { action: 'show-update-details' }
-            }, '*');
-          });
-        }
-
-        // --- Auto-refresh on pendant connect/disconnect ---
-        (function() {
-          var wsUrl;
-          if (window.location.port === '5174') {
-            wsUrl = 'ws://' + window.location.hostname + ':8090';
-          } else if (window.location.protocol === 'file:') {
-            wsUrl = 'ws://localhost:8090';
-          } else {
-            var u = new URL(window.location.origin);
-            u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-            wsUrl = u.toString();
-          }
-          var rws = new WebSocket(wsUrl);
-          rws.onmessage = function(event) {
-            if (window._wsFlashing) return;
-            try {
-              var msg = JSON.parse(event.data);
-              if (msg && (msg.type === 'client:connected' || msg.type === 'client:disconnected')) {
-                var d = msg.data || {};
-                if (d.product === 'ncSenderPendant') {
-                  window.postMessage({ type: 'close-plugin-dialog', data: { action: 'refresh' } }, '*');
-                  rws.close();
-                }
-              }
-            } catch (e) {}
-          };
-        })();
-      })();
-    </script>
-  `;
-}
-
-// --- Update Details Dialog ---
-
-function buildUpdateDetailsHtml(firmwareUpdate, pendant) {
-  const hasPendant = pendant !== null;
-  const pendantIp = hasPendant ? pendant.ip : null;
-
-  let publishedLine = '';
-  if (firmwareUpdate.publishedAt) {
-    try {
-      const d = new Date(firmwareUpdate.publishedAt);
-      publishedLine = `<div class="fud-published">Published: ${d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}</div>`;
-    } catch {}
-  }
-
-  return /* html */ `
-    <style>
-      .fud-container {
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-        padding: 20px;
-        max-width: 560px;
-      }
-      .fud-versions {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 16px;
-        padding: 12px;
-        background: var(--color-surface-muted);
-        border-radius: var(--radius-small);
-      }
-      .fud-version-block {
-        text-align: center;
-      }
-      .fud-version-label {
-        font-size: 0.75rem;
-        color: var(--color-text-secondary);
-        margin-bottom: 4px;
-      }
-      .fud-version-value {
-        font-family: monospace;
-        font-size: 1.1rem;
-        font-weight: 600;
-        color: var(--color-text-primary);
-      }
-      .fud-arrow {
-        font-size: 1.2rem;
-        color: var(--color-text-secondary);
-      }
-      .fud-published {
-        font-size: 0.8rem;
-        color: var(--color-text-secondary);
-        text-align: center;
-      }
-      .fud-notes-label {
-        font-size: 0.85rem;
-        font-weight: 600;
-        color: var(--color-text-primary);
-      }
-      .fud-notes {
-        max-height: 200px;
-        overflow-y: auto;
-        padding: 10px;
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-small);
-        font-size: 0.8rem;
-        color: var(--color-text-secondary);
-        white-space: pre-wrap;
-        word-break: break-word;
-        line-height: 1.5;
-      }
-      .fud-footer {
-        display: flex;
-        gap: 10px;
-        justify-content: center;
-        padding-top: 4px;
-      }
-      .fud-btn {
-        padding: 10px 20px;
-        border: none;
-        border-radius: var(--radius-small);
-        font-size: 0.9rem;
-        font-weight: 500;
-        cursor: pointer;
-        transition: opacity 0.2s;
-      }
-      .fud-btn:hover { opacity: 0.9; }
-      .fud-btn-primary {
-        background: var(--color-accent);
-        color: white;
-      }
-      .fud-btn-secondary {
-        background: var(--color-surface-muted);
-        color: var(--color-text-primary);
-        border: 1px solid var(--color-border);
-      }
-    </style>
-
-    <div class="fud-container">
-      <div class="fud-versions">
-        <div class="fud-version-block">
-          <div class="fud-version-label">Current</div>
-          <div class="fud-version-value">v${escapeHtml(firmwareUpdate.currentVersion)}</div>
-        </div>
-        <div class="fud-arrow">&rarr;</div>
-        <div class="fud-version-block">
-          <div class="fud-version-label">Latest</div>
-          <div class="fud-version-value">v${escapeHtml(firmwareUpdate.latestVersion)}</div>
-        </div>
-      </div>
-
-      ${publishedLine}
-
-      ${firmwareUpdate.releaseNotes ? `
-        <div>
-          <div class="fud-notes-label">Release Notes</div>
-          <div class="fud-notes">${escapeHtml(firmwareUpdate.releaseNotes)}</div>
-        </div>
-      ` : ''}
-
-      <div class="fud-footer">
-        <button type="button" class="fud-btn fud-btn-secondary" id="fudCloseBtn">Close</button>
-        ${firmwareUpdate.downloadUrl && hasPendant ? `<button type="button" class="fud-btn fud-btn-primary" id="fudDownloadBtn">Download &amp; Flash OTA</button>` : ''}
-      </div>
-    </div>
-
-    <script>
-      (function() {
-        var closeBtn = document.getElementById('fudCloseBtn');
-        if (closeBtn) {
-          closeBtn.addEventListener('click', function() {
-            window.postMessage({ type: 'close-plugin-dialog' }, '*');
-          });
-        }
-
-        var downloadBtn = document.getElementById('fudDownloadBtn');
-        if (downloadBtn) {
-          downloadBtn.addEventListener('click', function() {
             window.postMessage({
               type: 'close-plugin-dialog',
               data: {
-                action: 'download-and-flash',
-                downloadUrl: ${firmwareUpdate.downloadUrl ? JSON.stringify(firmwareUpdate.downloadUrl) : 'null'},
-                pendantIp: ${pendantIp ? JSON.stringify(pendantIp) : 'null'},
-                latestVersion: ${JSON.stringify(firmwareUpdate.latestVersion)}
+                action: 'flash',
+                firmwareBase64: fileBase64,
+                firmwareFileName: selectedFileName || 'firmware.bin',
+                method: 'usb',
+                port: portSelect.value,
+                baudRate: '115200'
               }
             }, '*');
-          });
+            return;
+          }
+
+          // OTA flashing - do client-side
+          var pendantIp = deviceInfo ? deviceInfo._ip : pendantIpInput.value.trim();
+          if (!pendantIp) {
+            alert('No pendant IP address');
+            return;
+          }
+
+          showOverlayProgress('Flashing Firmware', 'Preparing upload...', 0);
+
+          try {
+            // Decode base64 to binary
+            var binaryStr = atob(fileBase64);
+            var bytes = new Uint8Array(binaryStr.length);
+            for (var i = 0; i < binaryStr.length; i++) {
+              bytes[i] = binaryStr.charCodeAt(i);
+            }
+
+            var fileName = selectedFileName || 'firmware.bin';
+            var boundary = '------------------------' + Date.now().toString(16);
+
+            // Build multipart body
+            var header = '--' + boundary + '\\r\\n' +
+              'Content-Disposition: form-data; name="firmware"; filename="' + fileName + '"\\r\\n' +
+              'Content-Type: application/octet-stream\\r\\n\\r\\n';
+            var footer = '\\r\\n--' + boundary + '--\\r\\n';
+
+            var headerBytes = new TextEncoder().encode(header);
+            var footerBytes = new TextEncoder().encode(footer);
+
+            var body = new Uint8Array(headerBytes.length + bytes.length + footerBytes.length);
+            body.set(headerBytes, 0);
+            body.set(bytes, headerBytes.length);
+            body.set(footerBytes, headerBytes.length + bytes.length);
+
+            showOverlayProgress('Flashing Firmware', 'Uploading to pendant...', 10);
+
+            var response = await fetch('http://' + pendantIp + '/update', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'multipart/form-data; boundary=' + boundary
+              },
+              body: body
+            });
+
+            showOverlayProgress('Flashing Firmware', 'Upload complete, waiting for reboot...', 90);
+
+            if (response.ok) {
+              showOverlayResult('Flash Complete', 'Firmware flashed successfully. Device is rebooting.', true, function() {
+                // Device will reboot, wait a bit then try to reconnect
+                setTimeout(function() {
+                  connectBtn.click();
+                }, 3000);
+                collapseAll();
+              });
+            } else {
+              var errText = await response.text();
+              throw new Error('HTTP ' + response.status + ': ' + (errText || 'Upload failed'));
+            }
+
+          } catch (err) {
+            // Connection reset after upload often means success (device rebooted)
+            if (err.name === 'TypeError' && err.message.includes('Failed to fetch')) {
+              showOverlayResult('Flash Complete', 'Firmware uploaded. Device is rebooting.', true, function() {
+                setTimeout(function() { connectBtn.click(); }, 3000);
+                collapseAll();
+              });
+            } else {
+              showOverlayResult('Flash Failed', err.message || 'An unknown error occurred', false);
+            }
+          }
+        });
+
+        // Auto-connect if IP is saved
+        if (pendantIpInput.value.trim()) {
+          setTimeout(function() { connectBtn.click(); }, 100);
         }
       })();
     </script>
@@ -1435,24 +1166,21 @@ function buildProgressModalHtml() {
 // --- Result Modal ---
 
 function buildResultContent(title, message, type) {
-  const colorMap = {
-    success: { bg: '#28a74520', border: '#28a745', text: '#28a745' },
-    error: { bg: '#dc354520', border: '#dc3545', text: '#dc3545' }
-  };
-  const colors = colorMap[type] || colorMap.error;
+  const isSuccess = type === 'success';
+  const iconColor = isSuccess ? '#28a745' : '#dc3545';
+  const icon = isSuccess
+    ? `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="${iconColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg>`
+    : `<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="${iconColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`;
 
   return /* html */ `
-    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); min-width: 340px; max-width: 450px; overflow: hidden;">
-      <div style="padding: 1rem 1.25rem; border-bottom: 1px solid var(--color-border); text-align: center;">
-        <h3 style="color: var(--color-text-primary); margin: 0; font-size: 1.1rem; font-weight: 600;">${title}</h3>
+    <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); min-width: 320px; max-width: 400px; overflow: hidden;">
+      <div style="padding: 24px 24px 20px; text-align: center;">
+        <div style="margin-bottom: 16px;">${icon}</div>
+        <h3 style="color: var(--color-text-primary); margin: 0 0 8px; font-size: 1.1rem; font-weight: 600;">${title}</h3>
+        <p style="color: var(--color-text-secondary); margin: 0; font-size: 0.9rem; line-height: 1.5;">${message}</p>
       </div>
-      <div style="padding: 1.25rem;">
-        <div style="padding: 12px; border-radius: var(--radius-small); background: ${colors.bg}; border: 1px solid ${colors.border}; color: ${colors.text}; font-size: 0.9rem; text-align: center;">
-          ${message}
-        </div>
-      </div>
-      <div style="padding: 0.75rem 1.25rem; border-top: 1px solid var(--color-border); text-align: center;">
-        <button onclick="window.postMessage({ type: 'close-modal' }, '*')" style="padding: 8px 32px; border-radius: var(--radius-small); background: var(--color-accent); border: none; color: white; font-size: 0.9rem; cursor: pointer;">OK</button>
+      <div style="padding: 12px 24px 20px; text-align: center;">
+        <button onclick="window.postMessage({ type: 'close-modal' }, '*')" style="padding: 10px 40px; border-radius: var(--radius-small); background: var(--color-accent); border: none; color: white; font-size: 0.9rem; font-weight: 500; cursor: pointer;">OK</button>
       </div>
     </div>
   `;
@@ -1463,197 +1191,58 @@ function buildResultContent(title, message, type) {
 export async function onLoad(ctx) {
   ctx.log('Wireless Pendant Flasher plugin loaded');
 
-  const tracker = new PendantTracker(ctx);
-
-  ctx.registerEventHandler('client:connected', (data) => {
-    if (data.product === 'ncSenderPendant') {
-      ctx.log('Pendant connected:', data.machineId, 'ip:', data.ip);
-    }
-  });
-
-  ctx.registerEventHandler('client:disconnected', (data) => {
-    if (data.product === 'ncSenderPendant') {
-      ctx.log('Pendant disconnected:', data.machineId);
-    }
-  });
-
   ctx.registerToolMenu('Wireless Pendant', async () => {
-    let response;
-    let firmwareUpdate = null;
-    let cachedRelease = null;
+    const ports = await getSerialPorts();
+    const savedSettings = ctx.getSettings() || {};
 
-    // Fetch firmware release once
-    const pendant0 = tracker.getInfo();
-    if (pendant0 && pendant0.version) {
-      try {
-        cachedRelease = await fetchLatestFirmwareRelease();
-      } catch (err) {
-        ctx.log('Failed to check firmware updates:', err?.message || err);
-        cachedRelease = { error: 'Could not check for firmware updates' };
-      }
-    }
-
-    // Loop to support auto-refresh when pendant state changes
-    while (true) {
-      const ports = await getSerialPorts();
-      const savedSettings = ctx.getSettings() || {};
-      const pendant = tracker.getInfo();
-
-      firmwareUpdate = null;
-      if (pendant && pendant.version && cachedRelease) {
-        if (cachedRelease.error) {
-          firmwareUpdate = { error: cachedRelease.error };
-        } else {
-          firmwareUpdate = {
-            currentVersion: pendant.version,
-            latestVersion: cachedRelease.latestVersion,
-            hasUpdate: compareVersions(cachedRelease.latestVersion, pendant.version) > 0,
-            releaseNotes: cachedRelease.releaseNotes,
-            downloadUrl: cachedRelease.downloadUrl,
-            releaseUrl: cachedRelease.releaseUrl,
-            publishedAt: cachedRelease.publishedAt
-          };
-        }
-      }
-
-      const dialogHtml = buildDialogHtml(ports, pendant, savedSettings, firmwareUpdate);
-      response = await ctx.showDialog('Wireless Pendant', dialogHtml, { closable: true, width: '500px' });
-
-      if (response && response.action === 'refresh') continue;
-      break;
-    }
+    const dialogHtml = buildDialogHtml(ports, savedSettings);
+    const response = await ctx.showDialog('Wireless Pendant', dialogHtml, { closable: true, width: '520px' });
 
     if (!response || !response.action) return;
-    const savedSettings = ctx.getSettings() || {};
-    const pendant = tracker.getInfo();
-
-    // --- Handle: Web Serial done (browser-side flash completed) ---
-    if (response.action === 'web-serial-done') {
-      ctx.setSettings({
-        ...savedSettings,
-        lastMethod: 'usb',
-        lastBaudRate: response.baudRate || savedSettings.lastBaudRate
-      });
-      return;
-    }
-
-    // --- Handle: Show Update Details ---
-    if (response.action === 'show-update-details' && firmwareUpdate && firmwareUpdate.hasUpdate) {
-      const detailsHtml = buildUpdateDetailsHtml(firmwareUpdate, pendant);
-      const detailsResponse = await ctx.showDialog('Firmware Update', detailsHtml, { closable: true, width: '560px' });
-
-      if (detailsResponse && detailsResponse.action === 'download-and-flash') {
-        // Fall through to download-and-flash handler below
-        Object.assign(response, detailsResponse);
-      } else {
-        return;
-      }
-    }
-
-    // --- Handle: Download & Flash OTA ---
-    if (response.action === 'download-and-flash') {
-      const { downloadUrl, pendantIp, latestVersion } = response;
-
-      ctx.log('Download & Flash OTA:', downloadUrl, 'target:', pendantIp);
-      ctx.showModal(buildProgressModalHtml(), { closable: false });
-
-      const tmpDir = os.tmpdir();
-      const binPath = path.join(tmpDir, `pendant-firmware-${latestVersion}-${Date.now()}.bin`);
-
-      const broadcastProgress = (percent, message, log) => {
-        ctx.broadcast('pendant-flash:progress', { percent, message, log });
-      };
-
-      try {
-        broadcastProgress(undefined, 'Downloading firmware...', `Downloading from GitHub...\nVersion: ${latestVersion}`);
-
-        const dlResponse = await fetch(downloadUrl);
-        if (!dlResponse.ok) {
-          throw new Error(`Download failed (HTTP ${dlResponse.status})`);
-        }
-
-        const arrayBuffer = await dlResponse.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        await fs.writeFile(binPath, buffer);
-        ctx.log('Firmware downloaded to temp file:', binPath, `(${buffer.length} bytes)`);
-
-        broadcastProgress(0, 'Starting OTA flash...', `Target: ${pendantIp}\nFirmware size: ${buffer.length} bytes`);
-
-        const flasher = flashOTA({ binPath, pendantIp });
-
-        await new Promise((resolve, reject) => {
-          flasher.on('progress', (percent, msg) => broadcastProgress(percent, msg));
-          flasher.on('message', (msg) => broadcastProgress(undefined, msg, msg));
-          flasher.on('error', (msg) => {
-            ctx.broadcast('pendant-flash:error', { message: msg, log: msg });
-            reject(new Error(msg));
-          });
-          flasher.on('complete', (msg) => {
-            ctx.broadcast('pendant-flash:complete', { message: msg || 'Firmware updated successfully via OTA.' });
-            resolve();
-          });
-        });
-      } catch (err) {
-        ctx.log('Download & Flash failed:', err?.message || err);
-        ctx.broadcast('pendant-flash:error', {
-          message: err?.message || 'Download & Flash failed',
-          log: err?.message || 'Unknown error'
-        });
-      } finally {
-        try {
-          await fs.unlink(binPath);
-          ctx.log('Cleaned up temp file:', binPath);
-        } catch {
-          // ignore cleanup errors
-        }
-      }
-      return;
-    }
 
     // --- Handle: Activate License ---
     if (response.action === 'activate') {
-      const { machineId, installationId, productName } = response;
+      const { pendantIp, deviceId, installationId } = response;
 
-      ctx.setSettings({ ...savedSettings, lastInstallationId: installationId });
-      ctx.log('Activating pendant license:', installationId, 'machineId:', machineId, 'product:', productName);
+      const savedSettings = ctx.getSettings() || {};
+      ctx.setSettings({ ...savedSettings, lastInstallationId: installationId, lastPendantIp: pendantIp });
+      ctx.log('Activating pendant license:', installationId, 'deviceId:', deviceId, 'pendantIp:', pendantIp);
 
+      // Show spinner modal
       ctx.showModal(/* html */ `
-        <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); min-width: 340px; max-width: 450px; overflow: hidden;">
-          <div style="padding: 1rem 1.25rem; border-bottom: 1px solid var(--color-border); text-align: center;">
-            <h3 style="margin: 0; font-size: 1.1rem; font-weight: 600; color: var(--color-text-primary);">Activating License...</h3>
-          </div>
-          <div style="padding: 1.5rem; text-align: center;">
-            <div style="margin-bottom: 12px;">
-              <span style="display:inline-block;width:20px;height:20px;border:3px solid var(--color-border);border-top-color:var(--color-accent);border-radius:50%;animation:spin 0.8s linear infinite;"></span>
-            </div>
-            <p style="color: var(--color-text-secondary); margin: 0; font-size: 0.85rem;">Contacting activation server</p>
+        <div style="background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); min-width: 300px; max-width: 380px; overflow: hidden;">
+          <div style="padding: 28px 24px; text-align: center;">
+            <div style="width: 40px; height: 40px; border: 3px solid var(--color-border); border-top-color: var(--color-accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px;"></div>
+            <h3 style="color: var(--color-text-primary); margin: 0 0 8px; font-size: 1.1rem; font-weight: 600;">Activating License</h3>
+            <p style="color: var(--color-text-secondary); margin: 0; font-size: 0.9rem;">Contacting activation server...</p>
           </div>
         </div>
         <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
       `, { closable: false });
 
       try {
-        const licenseData = await activateWithServer(installationId, machineId, productName);
+        const licenseData = await activateWithServer(installationId, deviceId, 'ncSenderPendant');
         ctx.log('Activation server returned license data');
 
-        ctx.emitToClient('license-data', licenseData);
+        ctx.log('Sending license to pendant at:', pendantIp);
+        await activatePendant(pendantIp, licenseData);
+        ctx.log('Pendant activated successfully');
 
-        ctx.showModal(buildResultContent('License Activated', 'License data has been sent to the pendant.', 'success'));
+        await ctx.showModal(buildResultContent('License Activated', 'License has been activated on the pendant.', 'success'), { closable: true });
       } catch (err) {
         ctx.log('License activation failed:', err?.message || err);
-        ctx.showModal(buildResultContent('Activation Failed', err?.message || 'An unknown error occurred during activation.', 'error'));
+        await ctx.showModal(buildResultContent('Activation Failed', err?.message || 'An unknown error occurred during activation.', 'error'), { closable: true });
       }
       return;
     }
 
-    // --- Handle: Flash Firmware ---
+    // --- Handle: Flash Firmware (USB only - OTA is handled client-side) ---
     if (response.action === 'flash') {
       const { firmwareBase64, firmwareFileName, method, port, baudRate, pendantIp } = response;
 
       ctx.setSettings({
         ...savedSettings,
-        lastMethod: method,
-        lastBaudRate: baudRate || savedSettings.lastBaudRate
+        lastPendantIp: pendantIp || savedSettings.lastPendantIp
       });
 
       const tmpDir = os.tmpdir();
