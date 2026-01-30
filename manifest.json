@@ -1,7 +1,7 @@
 {
   "id": "com.ncsender.wireless-pendant",
   "name": "Wireless Pendant Flasher",
-  "version": "0.2.0",
+  "version": "0.1.4",
   "minAppVersion": "0.3.151",
   "entry": "index.js",
   "author": "ncSender",
