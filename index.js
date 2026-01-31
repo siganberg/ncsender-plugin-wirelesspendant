@@ -401,6 +401,7 @@ function buildDialogHtml(ports, savedSettings) {
       }
 
       .usb-options { margin-top: 8px; }
+      .method-toggle-3 label { font-size: 0.75rem; }
 
       .hidden { display: none !important; }
 
@@ -574,48 +575,57 @@ function buildDialogHtml(ports, savedSettings) {
           <div id="activateStatus" class="status-msg hidden"></div>
         </div>
 
-        <!-- Flash Section -->
-        <div id="flashSection">
-          <div class="section-divider"></div>
-          <div class="accordion-trigger" id="showFlashBtn">
-            <div class="accordion-trigger-content">
-              <span class="accordion-trigger-icon flash">&#8623;</span>
-              <span class="accordion-trigger-label">Flash Firmware</span>
-            </div>
-            <span class="accordion-trigger-chevron">&#9662;</span>
+      </div>
+
+      <!-- Flash Section (always visible) -->
+      <div id="flashSection">
+        <div class="section-divider"></div>
+        <div class="accordion-trigger" id="showFlashBtn">
+          <div class="accordion-trigger-content">
+            <span class="accordion-trigger-icon flash">&#8623;</span>
+            <span class="accordion-trigger-label">Flash Firmware</span>
           </div>
-
-          <div id="flashForm" class="accordion-content">
-            <div class="form-group">
-              <label>Firmware File</label>
-              <div class="file-picker">
-                <span class="file-name" id="fileName">No file selected</span>
-                <button type="button" class="btn btn-secondary" onclick="document.getElementById('firmwareFile').click()">Browse</button>
-                <input type="file" id="firmwareFile" accept=".bin" />
-              </div>
-            </div>
-
-            <div class="form-group">
-              <label>Flash Method</label>
-              <div class="method-toggle">
-                <input type="radio" name="method" id="methodOta" value="ota" checked />
-                <label for="methodOta">OTA (Wi-Fi)</label>
-                <input type="radio" name="method" id="methodUsb" value="usb" />
-                <label for="methodUsb">USB</label>
-              </div>
-            </div>
-
-            <div id="usbOptions" class="usb-options hidden">
-              <div class="form-group">
-                <label>Serial Port</label>
-                <select id="serialPort"></select>
-              </div>
-            </div>
-
-            <button type="button" class="btn btn-primary btn-full" id="flashBtn" disabled>Flash</button>
-          </div>
-          <div id="flashStatus" class="status-msg hidden"></div>
+          <span class="accordion-trigger-chevron">&#9662;</span>
         </div>
+
+        <div id="flashForm" class="accordion-content">
+          <div class="form-group">
+            <label>Firmware File</label>
+            <div class="file-picker">
+              <span class="file-name" id="fileName">No file selected</span>
+              <button type="button" class="btn btn-secondary" onclick="document.getElementById('firmwareFile').click()">Browse</button>
+              <input type="file" id="firmwareFile" accept=".bin" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Flash Method</label>
+            <div class="method-toggle method-toggle-3">
+              <input type="radio" name="method" id="methodOta" value="ota" checked />
+              <label for="methodOta">OTA (Wi-Fi)</label>
+              <input type="radio" name="method" id="methodUsbChrome" value="usb-chrome" />
+              <label for="methodUsbChrome">USB (Chrome)</label>
+              <input type="radio" name="method" id="methodUsbServer" value="usb-server" />
+              <label for="methodUsbServer">USB (Server)</label>
+            </div>
+          </div>
+
+          <div id="usbServerOptions" class="usb-options hidden">
+            <div class="form-group">
+              <label>Serial Port</label>
+              <select id="serialPort"></select>
+            </div>
+          </div>
+
+          <div id="usbChromeOptions" class="usb-options hidden">
+            <div class="form-group">
+              <span class="hint">Click Flash to select USB port and start flashing.</span>
+            </div>
+          </div>
+
+          <button type="button" class="btn btn-primary btn-full" id="flashBtn" disabled onclick="window._handleFlashClick()">Flash</button>
+        </div>
+        <div id="flashStatus" class="status-msg hidden"></div>
       </div>
     </div>
 
@@ -664,8 +674,13 @@ function buildDialogHtml(ports, savedSettings) {
         var fileInput = document.getElementById('firmwareFile');
         var fileNameEl = document.getElementById('fileName');
         var portSelect = document.getElementById('serialPort');
-        var usbOptions = document.getElementById('usbOptions');
+        var usbServerOptions = document.getElementById('usbServerOptions');
+        var usbChromeOptions = document.getElementById('usbChromeOptions');
         var methodRadios = document.querySelectorAll('input[name="method"]');
+
+        // Web Serial state
+        var wsPort = null;
+        var wsTransport = null;
 
         // Overlay elements
         var dialogOverlay = document.getElementById('dialogOverlay');
@@ -768,7 +783,8 @@ function buildDialogHtml(ports, savedSettings) {
         methodRadios.forEach(function(radio) {
           radio.addEventListener('change', function() {
             var method = document.querySelector('input[name="method"]:checked').value;
-            usbOptions.classList.toggle('hidden', method !== 'usb');
+            usbServerOptions.classList.toggle('hidden', method !== 'usb-server');
+            usbChromeOptions.classList.toggle('hidden', method !== 'usb-chrome');
             updateFlashBtn();
           });
         });
@@ -901,22 +917,28 @@ function buildDialogHtml(ports, savedSettings) {
         function updateFlashBtn() {
           var hasFile = fileBase64 !== null;
           var method = document.querySelector('input[name="method"]:checked').value;
-          var valid = hasFile && deviceInfo;
-          if (method === 'usb') {
+          var valid = false;
+
+          if (method === 'ota') {
+            valid = hasFile && deviceInfo;
+          } else if (method === 'usb-chrome') {
+            valid = hasFile && !!navigator.serial;
+          } else if (method === 'usb-server') {
             valid = hasFile && portSelect.value !== '';
           }
+
           flashBtn.disabled = !valid;
         }
 
         portSelect.addEventListener('change', updateFlashBtn);
 
-        flashBtn.addEventListener('click', async function() {
+        window._handleFlashClick = async function() {
           if (!fileBase64) return;
 
           var method = document.querySelector('input[name="method"]:checked').value;
 
-          // USB flashing needs server-side esptool
-          if (method === 'usb') {
+          // USB (Server) flashing - uses server-side esptool
+          if (method === 'usb-server') {
             window.postMessage({
               type: 'close-plugin-dialog',
               data: {
@@ -928,6 +950,12 @@ function buildDialogHtml(ports, savedSettings) {
                 baudRate: '115200'
               }
             }, '*');
+            return;
+          }
+
+          // USB (Chrome) flashing - uses Web Serial API with esptool-js
+          if (method === 'usb-chrome') {
+            await doWebSerialFlash();
             return;
           }
 
@@ -1001,7 +1029,107 @@ function buildDialogHtml(ports, savedSettings) {
               showOverlayResult('Flash Failed', err.message || 'An unknown error occurred', false);
             }
           }
-        });
+        };
+
+        // Web Serial flashing using esptool-js
+        async function doWebSerialFlash() {
+          // Ensure overlay is hidden before browser dialog
+          hideOverlay();
+
+          try {
+            // Check Web Serial API availability
+            if (!navigator.serial) {
+              throw new Error('Web Serial API not available. Use Chrome or Edge browser.');
+            }
+
+            // Request serial port from user (no filters to show all ports)
+            wsPort = await navigator.serial.requestPort();
+
+            showOverlayProgress('Flashing Firmware', 'Loading esptool...', 5);
+
+            // Load esptool-js from CDN
+            var esptoolModule = await import('https://esm.run/esptool-js');
+            var ESPLoader = esptoolModule.ESPLoader;
+            var Transport = esptoolModule.Transport;
+
+            showOverlayProgress('Flashing Firmware', 'Connecting to device...', 10);
+
+            // Create transport and loader
+            wsTransport = new Transport(wsPort, true);
+
+            var espTerminal = {
+              clean: function() {},
+              writeLine: function() {},
+              write: function() {}
+            };
+
+            var loader = new ESPLoader({
+              transport: wsTransport,
+              baudrate: 115200,
+              romBaudrate: 115200,
+              terminal: espTerminal
+            });
+
+            // Connect to chip - may need to hold BOOT button
+            showOverlayProgress('Flashing Firmware', 'Connecting... (hold BOOT button if needed)', 10);
+            await loader.main();
+
+            showOverlayProgress('Flashing Firmware', 'Connected: ' + loader.chip.CHIP_NAME, 15);
+
+            // Decode firmware - esptool-js expects binary string, not Uint8Array
+            var firmwareData = atob(fileBase64);
+
+            showOverlayProgress('Flashing Firmware', 'Writing firmware...', 20);
+
+            // Flash firmware at address 0x10000 (standard ESP32 app address)
+            await loader.writeFlash({
+              fileArray: [{ data: firmwareData, address: 0x10000 }],
+              flashSize: 'keep',
+              compress: true,
+              reportProgress: function(fileIndex, written, total) {
+                var pct = 20 + Math.round((written / total) * 75);
+                showOverlayProgress('Flashing Firmware', 'Writing: ' + Math.round((written / total) * 100) + '%', pct);
+              }
+            });
+
+            showOverlayProgress('Flashing Firmware', 'Resetting device...', 98);
+
+            // Hard reset - ignore errors as flash is already done
+            try {
+              await loader.hardReset();
+            } catch (e) {
+              // Ignore reset errors
+            }
+
+            // Close transport
+            try {
+              await wsTransport.disconnect();
+            } catch (e) {
+              // Ignore disconnect errors
+            }
+            wsTransport = null;
+            wsPort = null;
+
+            showOverlayResult('Flash Complete', 'Firmware flashed successfully via USB.', true, function() {
+              collapseAll();
+            });
+
+          } catch (err) {
+            // Clean up on error
+            if (wsTransport) {
+              try { await wsTransport.disconnect(); } catch (e) {}
+              wsTransport = null;
+            }
+            wsPort = null;
+
+            var msg = err.message || 'Unknown error';
+            if (msg.includes('No port selected')) {
+              hideOverlay();
+              return;
+            }
+            showOverlayResult('Flash Failed', msg, false);
+          }
+        }
 
         // Auto-connect if IP is saved
         if (pendantIpInput.value.trim()) {
