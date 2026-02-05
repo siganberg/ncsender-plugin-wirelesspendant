@@ -334,8 +334,9 @@ export class BLEManager {
       const data = JSON.stringify(message) + '\n';
       const buffer = Buffer.from(data, 'utf8');
 
-      // BLE has MTU limits, may need to chunk large messages
-      const chunkSize = 20; // Safe BLE chunk size
+      // BLE has MTU limits, chunk larger messages
+      // NimBLE typically negotiates 512+ byte MTU, use 200 bytes for safety
+      const chunkSize = 200;
       for (let i = 0; i < buffer.length; i += chunkSize) {
         const chunk = buffer.slice(i, Math.min(i + chunkSize, buffer.length));
         this.rxCharacteristic.write(chunk, true, (err) => {

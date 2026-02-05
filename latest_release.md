@@ -1,4 +1,4 @@
 ## What's Changed
 
-### ✨ New Features
-- Added support for connecting to multiple pendants simultaneously
+### 🐛 Bug Fixes
+- Fixed USB flashing for Chrome-based browsers
